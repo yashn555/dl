@@ -1,0 +1,505 @@
+======================================================================
+PS5 : FACIAL EMOTION RECOGNITION USING CNN (FER-2013)
+Notebook: ps05_fer2013_emotion_cnn.ipynb
+======================================================================
+
+----------------------------------------------------------------------
+1. PROBLEM STATEMENT (PS)
+----------------------------------------------------------------------
+Build a Convolutional Neural Network that detects human emotions from
+facial images (happy, sad, angry, etc.) using the FER-2013 dataset.
+
+Task type : 7-class single-label image classification
+Input     : 48 x 48 grayscale face crop
+Output    : probability distribution over
+            [angry, disgust, fear, happy, neutral, sad, surprise]
+Dataset   : FER-2013 (Facial Expression Recognition 2013)
+
+----------------------------------------------------------------------
+2. DATASET FACTS
+----------------------------------------------------------------------
+Total images : 35,887 (all 48x48 grayscale JPEGs)
+Official split: 28,709 training  /  3,589 PublicTest  /  3,589 PrivateTest
+Folder layout used here (Kaggle "msambare/fer2013"):
+    train/<emotion>/*.jpg   -> 28,709 images
+    test/<emotion>/*.jpg    ->  7,178 images (Public + Private combined)
+
+Training class distribution (full 28,709):
+    angry     3,995
+    disgust     436   <-- severe minority (~1.5%)
+    fear      4,097
+    happy     7,215   <-- majority (~25%)
+    neutral   4,965
+    sad       4,830
+    surprise  3,171
+
+This notebook further splits train into 90% train (25,839) and 10%
+validation (2,870) with a fixed seed. The test folder is NEVER used for
+training, early stopping, LR scheduling or checkpoint selection - it is
+opened once at the end for the final report.
+
+Important context: FER-2013 labels were collected by crowd-sourcing and
+are noisy; human accuracy on this dataset is only about 65% (+/-5%).
+Published state-of-the-art models reach roughly 73-76%. So a well-trained
+CNN scoring ~60-65% is a GOOD result, not a broken one.
+
+----------------------------------------------------------------------
+3. HOW TO RUN
+----------------------------------------------------------------------
+Requirements: TensorFlow >= 2.13, numpy, matplotlib, seaborn,
+scikit-learn, kagglehub (only for auto-download), and an NVIDIA GPU with
+>= 2 GB FREE VRAM (Colab T4 is ideal).
+
+Steps:
+ 1. Colab: Runtime > Change runtime type > T4 GPU.
+ 2. Provide the dataset in ONE of two ways:
+      a) Auto-download (default, DATA_DIR = None): add your Kaggle API
+         token as a Colab Secret named KAGGLE_API_TOKEN (or place
+         kaggle.json in ~/.kaggle). kagglehub then fetches
+         "msambare/fer2013" (~64 MB) automatically.
+      b) Manual: set DATA_DIR in Cell 2 to a folder that contains
+         train/ and test/ subfolders with one folder per emotion.
+ 3. Runtime > Run all.
+ 4. If no GPU or insufficient free VRAM is detected, Cell 1 prints a
+    friendly boxed message and stops the notebook immediately.
+
+Expected runtime on T4: first epoch ~30-40 s (cache fill), later epochs
+~8-12 s; up to 60 epochs -> roughly 8-12 minutes total (early stopping
+usually finishes sooner). Peak VRAM ~2 GB at batch 128 with mixed
+precision.
+
+----------------------------------------------------------------------
+4. PIPELINE OVERVIEW
+----------------------------------------------------------------------
+GPU/VRAM guard -> dataset acquisition -> 3-way split (train/val/test)
+-> class-imbalance weights -> EDA (class histogram + sample faces)
+-> cache/shuffle/prefetch -> VGG-style CNN with BatchNorm + augmentation
+-> training with class weights and 3 callbacks -> final test evaluation
+(curves, classification report, confusion matrix, sample predictions)
+-> save model + single-image inference helper.
+
+----------------------------------------------------------------------
+5. CELL-BY-CELL CODE COMMENTS (the notebook itself has no comments)
+----------------------------------------------------------------------
+
+--- Cell 1: GPU / VRAM safety gate ------------------------------------
+import subprocess                      # to call nvidia-smi
+import tensorflow as tf
+
+MIN_FREE_VRAM_MB = 2048                # headroom needed for batch 128
+
+gpus = tf.config.list_physical_devices('GPU')
+if not gpus:                           # no CUDA GPU -> stop early
+    ...print boxed instructions...
+    raise SystemExit('Stopped: no GPU available.')   # halts Run-all
+
+for gpu in gpus:
+    tf.config.experimental.set_memory_growth(gpu, True)
+    # allocate VRAM gradually instead of reserving the entire card;
+    # try/except makes re-running the cell safe after TF init
+
+free_mb = None
+try:
+    out = subprocess.check_output(
+        ['nvidia-smi', '--query-gpu=memory.free',
+         '--format=csv,noheader,nounits'], ...)
+    free_mb = max(int(v) for v in out.split())   # freest GPU if several
+except Exception:
+    print('Note: nvidia-smi not available; ...')  # warn, do not block
+
+if free_mb is not None and free_mb < MIN_FREE_VRAM_MB:
+    ...print found vs required + how to fix...
+    raise SystemExit('Stopped: insufficient free VRAM.')
+
+tf.keras.mixed_precision.set_global_policy('mixed_float16')
+# FP16 compute on Tensor Cores (~2x faster, ~half the activation memory);
+# master weights stay FP32 and Keras applies automatic loss scaling.
+# Must be set BEFORE any layer is built.
+
+--- Cell 2: imports and configuration ---------------------------------
+pathlib                 # filesystem paths
+numpy                   # arrays, label collection
+matplotlib / seaborn    # plots and confusion-matrix heatmap
+tensorflow as tf        # AUTOTUNE constant
+sklearn metrics         # classification_report, confusion_matrix
+compute_class_weight    # imbalance handling
+keras / layers          # model API
+
+DATA_DIR = None   # None -> auto-download via kagglehub; or set a path
+IMG = (48, 48)    # native FER-2013 resolution
+BATCH = 128       # fits comfortably in 2 GB with mixed precision
+EPOCHS = 60       # upper bound; EarlyStopping decides the real count
+SEED = 42
+keras.utils.set_random_seed(SEED)   # seeds Python + NumPy + TensorFlow
+
+--- Cell 3: dataset acquisition ---------------------------------------
+if DATA_DIR is None:
+    import kagglehub
+    DATA_DIR = kagglehub.dataset_download('msambare/fer2013')
+    # downloads once, caches locally, returns the dataset root path
+    # on failure: friendly boxed message with two fixes, then SystemExit
+
+train_dir = DATA_DIR/'train';  test_dir = DATA_DIR/'test'
+if either folder is missing -> SystemExit with the expected layout.
+# Fail fast with a clear message instead of a cryptic NotFoundError later.
+
+--- Cell 4: datasets, classes, imbalance weights ----------------------
+image_dataset_from_directory(train_dir, color_mode='grayscale',
+    image_size=IMG, batch_size=BATCH, label_mode='int',
+    validation_split=0.1, subset='training', seed=SEED)
+    # folder names become labels (alphabetical -> angry=0 ... surprise=6)
+    # label_mode='int' keeps integer labels (sparse cross-entropy)
+    # SAME seed + complementary subsets -> disjoint train/val, no leakage
+val_ds  : same call with subset='validation'
+test_ds : from test_dir, shuffle=False
+    # deterministic order so predictions align with collected labels
+
+class_names = train_ds.class_names    # read BEFORE .cache() wraps it
+num_classes = len(class_names)        # 7
+
+train_ds = train_ds.cache()           # decode JPEGs once, keep in RAM
+val_ds / test_ds = .cache()           # (~330 MB total for all three)
+
+y_train_all = np.concatenate([y.numpy() for _, y in train_ds])
+    # one pass over the cached training set to collect all labels
+weights = compute_class_weight('balanced',
+              classes=np.arange(num_classes), y=y_train_all)
+class_weight = dict(enumerate(weights))
+    # w_c = N / (K * N_c): rare classes get large weights, common ones
+    # small. disgust ~9-10x, happy ~0.57x. Passed to model.fit so the
+    # loss penalises mistakes on rare emotions much more strongly.
+
+--- Cell 5: EDA + input pipeline --------------------------------------
+counts = np.bincount(y_train_all, minlength=num_classes)
+plt.bar(class_names, counts)      # visualises the disgust imbalance
+# sample grid: 7 faces with their emotion labels (sanity check)
+
+AUTOTUNE = tf.data.AUTOTUNE
+train_ds = train_ds.shuffle(2048, seed=SEED).prefetch(AUTOTUNE)
+    # shuffle AFTER cache: cheap re-randomisation every epoch while
+    # JPEG decoding still happens only once
+val_ds / test_ds = .prefetch(AUTOTUNE)   # overlap I/O with GPU compute
+    # no shuffle for val/test -> stable, reproducible metric ordering
+
+--- Cell 7: the CNN ---------------------------------------------------
+Input(48,48,1)
+Rescaling(1/255)                 # [0,255] -> [0,1]; baked into the model
+                                 # so deployment needs no manual scaling
+RandomFlip('horizontal')         # faces are left-right symmetric in
+                                 # emotion; vertical flip would be absurd
+RandomRotation(0.1)              # +/- ~36 degrees*0.1 -> small tilts
+RandomZoom(0.1)                  # +/-10% scale robustness
+# These 3 layers are ACTIVE ONLY during fit(); identity at val/inference.
+
+Block 1: Conv2D(32,3,same,use_bias=False) -> BN -> ReLU  (x2)
+         MaxPooling2D()  48 -> 24 ;  Dropout(0.25)
+Block 2: Conv2D(64,3,same,use_bias=False) -> BN -> ReLU  (x2)
+         MaxPooling2D()  24 -> 12 ;  Dropout(0.25)
+Block 3: Conv2D(128,3,same,use_bias=False) -> BN -> ReLU (x2)
+         MaxPooling2D()  12 -> 6  ;  Dropout(0.25)
+Flatten()                        # 6*6*128 = 4608 features
+Dense(256, use_bias=False) -> BN -> ReLU -> Dropout(0.5)
+Dense(7, softmax, dtype='float32')
+    # softmax pinned to FP32 for numerical stability under mixed_float16
+
+Design notes:
+ - padding='same' keeps spatial size inside a block; pooling does the
+   downsampling, so no information is lost at block edges.
+ - Conv -> BN -> ReLU is the canonical order: BN normalises the pre-
+   activation, keeping ReLU inputs centred (better gradient flow).
+ - use_bias=False before BN because BN's beta already provides a shift;
+   the conv bias would be cancelled by BN's mean subtraction (redundant).
+ - ~1.47M parameters total (~5.6 MB) - deliberately small for 25.8k
+   training images.
+
+compile: Adam(1e-3), sparse_categorical_crossentropy (integer labels),
+         metrics=['accuracy'].
+
+--- Cell 9: training --------------------------------------------------
+ModelCheckpoint('best_emotion_cnn.keras', monitor='val_accuracy',
+                save_best_only=True)
+    # writes the best-validation model to disk (disconnect insurance)
+ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=4,
+                  min_lr=1e-6, verbose=1)
+    # halve LR when val_loss stalls 4 epochs -> fine convergence
+EarlyStopping(monitor='val_loss', patience=12, restore_best_weights=True)
+    # stop after 12 stagnant epochs and roll back to the best weights
+
+model.fit(train_ds, validation_data=val_ds, epochs=EPOCHS,
+          class_weight=class_weight, callbacks=callbacks, verbose=2)
+    # class_weight multiplies each sample's loss by its class weight
+    # verbose=2 -> one line per epoch
+
+--- Cell 11: final test evaluation + curves ---------------------------
+model.evaluate(test_ds)   # the ONE time the test set is touched
+# prints test accuracy and test loss (loss is cross-entropy, not a %)
+# two plots: train vs validation loss and accuracy per epoch
+# a widening gap = overfitting; the callbacks keep the best point
+
+--- Cell 12: per-class report + confusion matrix ----------------------
+y_true = np.concatenate([y.numpy() for _, y in test_ds])
+    # test_ds is unshuffled -> labels align with prediction order
+y_pred = model.predict(test_ds, verbose=0).argmax(axis=1)
+classification_report(..., digits=4, zero_division=0)
+    # precision / recall / F1 / support per emotion + macro & weighted
+    # zero_division=0 avoids warnings if a class is never predicted
+sns.heatmap(confusion_matrix(y_true, y_pred), annot=True, fmt='d', ...)
+    # rows = actual, columns = predicted; diagonal = correct
+
+--- Cell 13: qualitative check ----------------------------------------
+# first 8 test faces, predicted (P) vs actual (A) in the title,
+# green = correct, red = wrong -> fast visual error analysis
+
+--- Cell 15: save + single-image inference ----------------------------
+model.save('emotion_cnn_final.keras')
+    # native Keras format; includes Rescaling and the (now inert)
+    # augmentation layers, so the saved model is self-contained
+
+def predict_image(path):
+    load_img(path, color_mode='grayscale', target_size=IMG)
+    img_to_array(...)[None, ...]        # add batch dimension -> (1,48,48,1)
+    probs = model.predict(x)[0]         # 7 probabilities
+    # display the face with winning emotion + confidence,
+    # return {emotion: probability} for all 7 classes
+# Usage: predict_image('some_face.jpg')  (crop the face first for best
+# results - the model expects a tight face crop like FER-2013).
+
+----------------------------------------------------------------------
+6. MODEL THEORY
+----------------------------------------------------------------------
+6.1 Why a CNN for faces?
+    Emotion lives in local spatial patterns: eyebrow angle, mouth
+    curvature, eye openness. Convolution slides small learnable kernels
+    over the image, so the same "smile corner" detector works anywhere
+    (weight sharing + translation equivariance). Stacking blocks builds
+    a hierarchy: edges -> facial parts -> expression configuration.
+    A Dense net on raw pixels would need far more parameters and would
+    not exploit spatial locality.
+
+6.2 Convolution arithmetic
+    Output channels = number of filters; each filter is K x K x C_in
+    (+1 bias if used). Params = K*K*C_in*C_out.
+    Example: 3x3, 64 -> 128 channels = 3*3*64*128 = 73,728 weights.
+    padding='same' pads so H,W are preserved; 'valid' would shrink by 2.
+    ReLU = max(0,x) introduces non-linearity without saturating positive
+    gradients.
+
+6.3 MaxPooling2D(2x2)
+    Takes the max in each 2x2 window: halves H and W (48->24->12->6),
+    cuts computation, and gives small translation invariance.
+
+6.4 BatchNormalization (the key accuracy ingredient)
+    Per channel, normalise activations to zero mean / unit variance
+    using batch statistics, then rescale with learnable gamma, beta:
+        y = gamma * (x - mu_B)/sqrt(var_B + eps) + beta
+    At inference it uses moving averages collected during training.
+    Benefits: stabilises/accelerates training, allows higher LR, reduces
+    sensitivity to initialisation, acts as mild regularisation.
+    Placed BEFORE ReLU (Conv -> BN -> ReLU) and paired with
+    use_bias=False in the preceding conv (BN's beta replaces the bias).
+
+6.5 Dropout
+    During training, randomly zeroes a fraction p of activations and
+    rescales the rest, preventing co-adaptation. p=0.25 after pooling
+    blocks (light), p=0.5 before the classifier (strong, standard).
+    Disabled automatically at validation/inference.
+
+6.6 Data augmentation
+    RandomFlip(horizontal), RandomRotation(0.1), RandomZoom(0.1) create
+    label-preserving variants, effectively enlarging the dataset and
+    reducing overfitting. They live INSIDE the model: GPU-accelerated,
+    training-only, and still random every epoch despite dataset caching.
+    No vertical flip / heavy distortion - those would destroy the
+    geometry that defines an expression.
+
+6.7 Class imbalance and class weights
+    disgust has 436 images vs happy's 7,215 (16.5x). Unweighted training
+    lets the model ignore disgust (it can score ~25% by guessing happy).
+    compute_class_weight('balanced') gives
+        w_c = N_total / (K * N_c)
+    so each class contributes equally to the expected loss.
+    Effect: disgust RECALL rises sharply, its PRECISION usually drops
+    (more false positives) - the intended trade-off. Overall accuracy may
+    dip slightly while MACRO F1 improves; macro F1 is the fairer metric
+    on this dataset.
+
+6.8 Loss and output
+    softmax converts 7 logits to probabilities summing to 1.
+    sparse_categorical_crossentropy = -log p(true class), accepting
+    integer labels (no one-hot needed). Adam(1e-3) adapts per-parameter
+    step sizes; ReduceLROnPlateau then refines with smaller steps.
+
+6.9 Mixed precision (mixed_float16)
+    Convolutions/matmuls run in FP16 on Tensor Cores (T4 = compute
+    capability 7.5): ~2x throughput, ~half the activation memory.
+    Master weights remain FP32; Keras wraps the optimizer with automatic
+    loss scaling so tiny gradients do not underflow. The final softmax
+    layer is pinned to dtype='float32' because exp/sum in FP16 can be
+    numerically unstable.
+
+6.10 tf.data pipeline
+    cache()    : decode + resize once, then stream tensors from RAM
+                 (huge win on Colab's 2 vCPUs).
+    shuffle()  : applied AFTER cache so order still randomises each epoch.
+    prefetch(AUTOTUNE) : prepares batch N+1 while the GPU trains on N.
+    test_ds is created with shuffle=False so labels and predictions align.
+
+6.11 Evaluation metrics
+    Precision_c = TP/(TP+FP)  - purity of predictions for class c
+    Recall_c    = TP/(TP+FN)  - coverage of real class-c samples
+    F1_c        = harmonic mean of the two
+    Macro avg   = unweighted mean over classes (treats disgust equally)
+    Weighted avg= mean weighted by support
+    Confusion matrix: rows actual, columns predicted; off-diagonal hot
+    spots reveal WHICH emotions are confused.
+    Accuracy alone is misleading under imbalance -> always report macro
+    F1 and the confusion matrix alongside it.
+
+----------------------------------------------------------------------
+7. EXPECTED RESULTS (T4, approximate)
+----------------------------------------------------------------------
+Test accuracy : ~0.60 - 0.64
+Test loss     : ~1.0 - 1.2
+Macro F1      : ~0.55 - 0.62
+Per-class behaviour:
+    happy    : highest recall (~0.80+), easiest expression
+    surprise : high recall (distinctive open mouth / raised brows)
+    neutral  : moderate-high
+    sad/angry: moderate, often confused with each other and with fear
+    fear     : hardest, frequently predicted as sad or surprise
+    disgust  : low precision but non-trivial recall thanks to weights
+Typical confusions: fear<->sad, angry<->disgust, fear<->surprise.
+Training usually stops between epoch 30 and 60 via EarlyStopping.
+Remember: ~65% human accuracy is the practical ceiling for this data.
+
+----------------------------------------------------------------------
+8. VIVA QUESTIONS AND ANSWERS
+----------------------------------------------------------------------
+Q1. What does this project do?
+    Classifies a 48x48 grayscale face crop into one of 7 emotions using
+    a CNN trained on FER-2013, then reports accuracy, per-class metrics
+    and a confusion matrix on a held-out test set.
+
+Q2. Why a CNN rather than a fully connected network?
+    Local receptive fields + weight sharing exploit spatial structure
+    (eyes, mouth) with far fewer parameters, and give translation
+    equivariance; stacking blocks learns a feature hierarchy.
+
+Q3. Describe FER-2013.
+    35,887 48x48 grayscale faces, 7 emotions; 28,709 train and 7,178
+    test here. Crowd-sourced labels are noisy; disgust has only 436
+    training images while happy has 7,215. Human accuracy ~65%.
+
+Q4. Why grayscale and 48x48?
+    That is the native dataset format; expression is carried by shape
+    and shading more than colour, and small inputs keep training fast.
+
+Q5. Why three splits instead of two?
+    Validation drives early stopping, LR reduction and checkpoint
+    selection; if the test set were used for those decisions the final
+    number would be optimistically biased (test leakage). Here test is
+    evaluated exactly once, at the end.
+
+Q6. How many parameters does a conv layer have? Example.
+    K*K*C_in*C_out (+C_out if bias). 3x3, 64->128 = 73,728 (no bias).
+
+Q7. Why padding='same'?
+    Preserves spatial size within a block so only pooling downsamples;
+    avoids losing border information at every convolution.
+
+Q8. What does MaxPooling do?
+    Halves height/width by taking the max per 2x2 window: less compute,
+    larger receptive field, small translation invariance.
+
+Q9. Explain BatchNormalization and why it is placed before ReLU.
+    Normalises each channel using batch statistics then rescales with
+    learnable gamma/beta (moving averages at inference). Before ReLU it
+    keeps pre-activations centred, stabilising gradients and allowing a
+    higher learning rate; it is the single biggest accuracy booster in
+    this architecture.
+
+Q10. Why use_bias=False in convolutions followed by BN?
+    BN subtracts the mean, cancelling any conv bias, and its beta
+    provides the shift anyway - the bias would be a redundant parameter.
+
+Q11. What is Dropout and why 0.25 / 0.5?
+    Randomly zeroes activations during training to prevent
+    co-adaptation. Light (0.25) after conv blocks to keep features,
+    strong (0.5) before the dense classifier where overfitting risk is
+    highest. Inactive at inference.
+
+Q12. Why horizontal flip but not vertical?
+    Emotion is preserved under mirroring; upside-down faces are not a
+    realistic variation and would destroy the geometry the model needs.
+
+Q13. How is class imbalance handled? Give the formula.
+    class_weight='balanced': w_c = N/(K*N_c). disgust gets ~9-10x,
+    happy ~0.57x, so rare emotions dominate the loss proportionally.
+    Alternatives: oversampling, focal loss, or collecting more data.
+
+Q14. What is the trade-off introduced by class weights?
+    Rare-class recall improves, precision typically falls, overall
+    accuracy may drop slightly - but macro F1 (the fair metric) improves.
+
+Q15. Why sparse_categorical_crossentropy?
+    Labels are integer ids, so no one-hot expansion is needed; it
+    computes -log p(true class) and pairs correctly with softmax.
+
+Q16. What is mixed precision and why is the output layer float32?
+    FP16 compute + FP32 master weights with automatic loss scaling:
+    ~2x faster on Tensor Cores, less VRAM. Softmax in FP16 can
+    overflow/underflow, so the final Dense is pinned to float32.
+
+Q17. Explain the three callbacks.
+    ModelCheckpoint saves the best val_accuracy model; ReduceLROnPlateau
+    halves LR after 4 stagnant val_loss epochs; EarlyStopping stops after
+    12 stagnant epochs and restores the best weights.
+
+Q18. Why is ~63% accuracy acceptable here?
+    FER-2013 labels are noisy and expressions are genuinely ambiguous;
+    humans score ~65% and published SOTA is ~73-76%. A small from-scratch
+    CNN at 60-65% is close to the practical ceiling for this setup.
+
+Q19. Which metric would you report and why?
+    Macro F1 plus the confusion matrix (and accuracy for reference),
+    because imbalance makes plain accuracy hide failure on disgust.
+
+Q20. How do you read the confusion matrix? Which classes confuse?
+    Rows = actual, columns = predicted; diagonal = correct. Typical
+    errors: fear<->sad, angry<->disgust, fear<->surprise; happy and
+    surprise are the most reliably recognised.
+
+Q21. Why cache() before shuffle(), and why prefetch?
+    Caching stores decoded tensors so JPEG decoding happens once;
+    shuffling after the cache still randomises order every epoch;
+    prefetch overlaps input preparation with GPU computation.
+
+Q22. What does the first cell do and why?
+    Checks for a CUDA GPU, enables memory growth, measures free VRAM via
+    nvidia-smi and exits with clear instructions if requirements are not
+    met - preventing a silent multi-hour CPU run or a mid-training OOM.
+
+Q23. How would you push accuracy higher?
+    Transfer learning (ResNet/EfficientNet on 96x96 or 224x224 RGB
+    upscaled faces), attention modules, label smoothing, focal loss,
+    test-time augmentation, ensembles, or cleaner/larger datasets
+    (RAF-DB, AffectNet).
+
+Q24. How is the trained model reused?
+    keras.models.load_model('best_emotion_cnn.keras'); the saved model
+    contains Rescaling, so predict on a (N,48,48,1) batch directly -
+    exactly what predict_image() demonstrates for a single face crop.
+
+----------------------------------------------------------------------
+9. QUICK TROUBLESHOOTING
+----------------------------------------------------------------------
+"GPU NOT FOUND" box        -> enable the Colab GPU runtime, Run all again.
+"NOT ENOUGH FREE VRAM"     -> close other GPU apps/notebooks, restart the
+                              kernel; or lower BATCH to 64.
+"DATASET DOWNLOAD FAILED"  -> add KAGGLE_API_TOKEN secret, or set
+                              DATA_DIR to a local FER-2013 folder.
+Slow epochs (>60 s)        -> you are on CPU, or cache was skipped.
+disgust recall = 0         -> class weights missing/not passed to fit.
+Re-running cells           -> memory growth is wrapped in try/except, so
+                              the guard cell is safe to re-run.
+======================================================================

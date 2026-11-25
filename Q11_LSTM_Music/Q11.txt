@@ -1,0 +1,348 @@
+======================================================================
+PS11 : MUSIC GENRE CLASSIFICATION USING LSTM (GTZAN)
+Notebook: ps11_lstm_music_genre.ipynb
+======================================================================
+
+----------------------------------------------------------------------
+1. PROBLEM STATEMENT (PS)
+----------------------------------------------------------------------
+Build a Long Short-Term Memory (LSTM) network to classify audio tracks
+into 10 music genres using the GTZAN dataset. The model processes audio
+features (MFCCs) over time to capture the temporal dynamics, rhythmic
+patterns, and evolving instrumentation characteristic of different genres.
+
+Task type : 10-class audio classification
+Input     : 3-second audio segment -> 130 frames of 13 MFCCs
+Output    : probability distribution over 10 genres
+Dataset   : GTZAN (10 genres, 100 tracks of 30s each = 1000 tracks)
+
+----------------------------------------------------------------------
+2. DATASET FACTS
+----------------------------------------------------------------------
+Total: 1000 audio tracks (.wav), 30 seconds each, 22050 Hz sample rate.
+Genres (10): blues, classical, country, disco, hiphop, jazz, metal, pop,
+             reggae, rock. (100 tracks per genre).
+Known issue: `jazz.00054.wav` is corrupt in the original dataset and
+             will be skipped gracefully by the extraction function.
+
+Split strategy:
+  The dataset is split 80/20 BY SONG (stratified).
+  800 songs -> 8000 segments for training (with 15% val split).
+  200 songs -> 2000 segments for testing.
+  Splitting by song is CRITICAL: if we split by segment, consecutive
+  3-second chunks of the same song would end up in both train and test,
+  causing massive data leakage and artificially inflated accuracy.
+
+----------------------------------------------------------------------
+3. HOW TO RUN
+----------------------------------------------------------------------
+Requirements: Colab T4 GPU, librosa, kagglehub, scikit-learn,
+TensorFlow/Keras. A Kaggle API token is needed for auto-download.
+
+ 1. Runtime > Change runtime type > T4 GPU.
+ 2. Add KAGGLE_API_TOKEN secret.
+ 3. Run all.
+
+The first cell is a GPU/VRAM gate that ensures a CUDA GPU is present
+and has sufficient free memory. Audio preprocessing (librosa) is
+CPU-bound and takes ~2-4 minutes; LSTM training on the extracted
+features is GPU-bound and takes ~2-3 minutes. Total time < 10 minutes.
+
+----------------------------------------------------------------------
+4. CELL-BY-CELL CODE COMMENTS
+----------------------------------------------------------------------
+
+--- Cell 1: GPU / VRAM gate -------------------------------------------
+Checks CUDA availability and free VRAM. Raises a friendly RuntimeError
+if requirements (>= 2 GB total, >= 1 GB free) are not met, stopping
+execution before wasting time on feature extraction.
+
+--- Cell 2: Install + Imports + Config --------------------------------
+Installs librosa (audio processing) and kagglehub.
+SR = 22050         : standard audio sample rate for ML.
+SEGMENTS = 10      : number of 3-second chunks per 30s track.
+N_MFCC = 13        : number of Mel-frequency cepstral coefficients.
+SEG_LEN = 66150    : samples per segment (22050 * 3).
+
+--- Cell 3: Dataset download and genre discovery ----------------------
+Downloads GTZAN via kagglehub. Recursively searches for the
+`genres_original` folder (handles varying Kaggle archive structures).
+Extracts the 10 genre names alphabetically.
+
+--- Cell 4: MFCC extraction function and file inventory ---------------
+extract_mfcc(path):
+  - Loads audio with librosa (duration=30s).
+  - Catches exceptions (e.g., the corrupt jazz.00054.wav) and returns None.
+  - Slices the signal into 10 segments of 3 seconds.
+  - Computes 13 MFCCs for each segment -> shape (13, 130).
+  - Transposes to (130, 13) because LSTMs expect (time_steps, features).
+  - Returns a list of 10 matrices (one per segment).
+Builds the master list of file paths and integer labels.
+
+--- Cell 5: Train/Test split and feature extraction -------------------
+train_test_split(..., stratify=labels) splits the FILE PATHS, not the
+segments. This guarantees no song is in both train and test.
+Iterates over train files, extracts MFCCs, and flattens the list of
+segments into X_train (shape: N_segments, 130, 13).
+Repeats for test files -> X_test.
+Expected shapes: X_train ~ (8000, 130, 13), X_test ~ (2000, 130, 13).
+
+--- Cell 6: Feature normalization -------------------------------------
+StandardScaler is fitted on the TRAINING segments only.
+The 3D tensor is temporarily flattened to (N, 130*13) for the scaler,
+then reshaped back to (N, 130, 13).
+Normalization is crucial for LSTMs to prevent vanishing/exploding
+gradients and to ensure all MFCC coefficients contribute equally.
+Plots a raw MFCC spectrogram vs a normalized one for visual verification.
+
+--- Cell 8: Model definition ------------------------------------------
+Input((130, 13))          : 130 time steps, 13 features per step.
+LSTM(128, return_sequences=True) : processes the sequence, outputs 128
+                                   features at every time step.
+LSTM(64)                  : processes the 128-dim sequence, outputs a
+                            single 64-dim vector summarizing the 3s clip.
+Dense(64, relu) + Dropout(0.3) : non-linear mixing and regularization.
+Dense(10, softmax)        : 10-way classification.
+Compiled with Adam and sparse_categorical_crossentropy.
+
+--- Cell 10: Training -------------------------------------------------
+validation_split=0.15 holds out 15% of the TRAINING segments for
+monitoring. (Note: this is segment-level validation, which is slightly
+optimistic due to intra-song correlation, but standard for this setup).
+EarlyStopping (patience=5) and ReduceLROnPlateau (patience=3) prevent
+overfitting and refine convergence.
+
+--- Cell 12: Segment-level evaluation ---------------------------------
+Evaluates the model on the 2000 test segments.
+Plots training vs validation loss and accuracy curves.
+
+--- Cell 13: Confusion matrix and classification report ---------------
+Generates predictions for all test segments.
+Prints precision, recall, F1 per genre.
+Plots the confusion matrix. Typical confusions:
+  - rock vs metal (similar instrumentation/distortion)
+  - country vs blues (similar chord progressions/tempo)
+  - classical vs jazz (complex harmonics, though classical is usually
+    purely acoustic while jazz has swing rhythms).
+
+--- Cell 15: Song-level prediction ------------------------------------
+predict_song(path):
+  - Extracts all 10 segments from the 30s track.
+  - Normalizes them using the saved scaler.
+  - Predicts probabilities for all 10 segments.
+  - Averages the probabilities across the 10 segments (mean pooling).
+  - Returns the genre with the highest average probability.
+This is much more robust than predicting a single 3s clip, as it
+integrates evidence from the entire track. Prints 5 test songs as a demo.
+
+--- Cell 17: Save artifacts -------------------------------------------
+Saves the Keras model and the scikit-learn scaler (as a pickle file)
+to the `outputs/` directory. Both are required for inference on new
+audio files later.
+
+----------------------------------------------------------------------
+5. MODEL THEORY
+----------------------------------------------------------------------
+5.1 Why LSTM for audio?
+    Audio is inherently sequential; the rhythm, tempo, and evolution of
+    timbre over time define the genre. A standard Dense network treats
+    each frame independently and loses temporal order. CNNs capture
+    local spectrogram patterns but have limited receptive fields.
+    RNNs maintain a hidden state that updates at every time step,
+    effectively "remembering" the rhythmic context of the 3-second clip.
+    LSTM (Long Short-Term Memory) is used instead of SimpleRNN because
+    130 time steps is long enough to cause vanishing gradients in a
+    vanilla RNN; LSTM's gated cell state preserves long-range temporal
+    dependencies.
+
+5.2 MFCC (Mel-Frequency Cepstral Coefficients)
+    The raw audio waveform is too high-dimensional and noisy. MFCCs
+    compress the audio into a compact representation that mimics human
+    hearing:
+    1. Frame the signal (short-time Fourier transform).
+    2. Map frequencies to the Mel scale (logarithmic, perceptual).
+    3. Take the log of the energies.
+    4. Apply Discrete Cosine Transform (DCT) to decorrelate the bins.
+    The result is 13 coefficients per frame representing the spectral
+    envelope (timbre/instrumentation) of that 23ms window.
+
+5.3 Input Shape and Many-to-One Architecture
+    Input: (batch_size, 130 time_steps, 13 features).
+    The first LSTM returns a sequence of 130 hidden states.
+    The second LSTM returns only the FINAL hidden state (many-to-one),
+    which acts as a fixed-size summary vector of the entire 3-second
+    temporal evolution. This vector is passed to the Dense classifier.
+
+5.4 Vanishing Gradient in LSTM
+    The vanishing gradient problem in SimpleRNN occurs because the
+    gradient is multiplied by the recurrent weight matrix at every time
+    step. LSTM solves this with a CELL STATE (c_t) that flows through
+    the network with minimal modification. The gates control how much
+    information is added, removed, or exposed:
+      f_t = sigmoid(W_f * [h_{t-1}, x_t] + b_f)    (forget gate)
+      i_t = sigmoid(W_i * [h_{t-1}, x_t] + b_i)    (input gate)
+      c_tilde = tanh(W_c * [h_{t-1}, x_t] + b_c)   (candidate)
+      c_t = f_t * c_{t-1} + i_t * c_tilde          (cell update)
+      o_t = sigmoid(W_o * [h_{t-1}, x_t] + b_o)    (output gate)
+      h_t = o_t * tanh(c_t)                        (hidden state)
+    The additive cell update (c_t = f_t * c_{t-1} + i_t * c_tilde)
+    allows gradients to flow back through many time steps without
+    decaying exponentially.
+
+5.5 Song-level vs Segment-level Evaluation
+    The model is trained and evaluated on 3-second segments. However,
+    a 30-second song contains 10 segments. Predicting the genre of the
+    whole song requires aggregating segment predictions. Averaging the
+    softmax probabilities (mean pooling) is a simple and effective
+    ensemble method that smooths out anomalies in individual segments
+    (e.g., a quiet intro or a spoken-word break).
+
+5.6 Data Leakage Prevention
+    If we extracted all 10,000 segments first and then did a random
+    80/20 split, segments from the SAME song would appear in both train
+    and test sets. The model would memorize the specific song rather
+    than learning general genre features, leading to ~95%+ test accuracy
+    that fails completely on new music. Splitting the file paths BEFORE
+    extraction guarantees strict song-level separation.
+
+----------------------------------------------------------------------
+6. EXPECTED RESULTS
+----------------------------------------------------------------------
+Segment-level test accuracy : ~0.68 - 0.78 (LSTM performs better than
+                                             SimpleRNN due to gated cells).
+Song-level test accuracy    : ~0.78 - 0.88 (averaging boosts performance).
+Typical confusions: rock/metal, country/blues.
+Classical and metal are usually the easiest (distinct acoustic vs
+highly distorted profiles). Disco and hiphop can be confused due to
+similar electronic drum beats and tempos.
+
+----------------------------------------------------------------------
+7. VIVA QUESTIONS AND ANSWERS
+----------------------------------------------------------------------
+Q1. What is the GTZAN dataset?
+    A standard benchmark for music genre classification containing 1000
+    audio tracks of 30 seconds each, evenly divided into 10 genres.
+
+Q2. Why did you split the data by song instead of by segment?
+    To prevent data leakage. Consecutive 3-second segments of the same
+    song are highly correlated. If they appear in both train and test
+    sets, the model memorizes the song rather than learning genre
+    features, resulting in artificially high test accuracy.
+
+Q3. What are MFCCs and why use them?
+    Mel-Frequency Cepstral Coefficients represent the short-term power
+    spectrum of audio on a perceptual Mel scale. They capture the
+    timbre and instrumentation (the "texture" of the sound) while
+    ignoring pitch, making them ideal for genre classification.
+
+Q4. Why use an LSTM instead of a SimpleRNN or Dense network?
+    Dense networks ignore the temporal order of audio frames. SimpleRNNs
+    suffer from vanishing gradients over long sequences (130 steps).
+    LSTM uses gated memory cells to retain rhythmic and temporal context
+    over the entire 3-second clip, making it far more effective for
+    audio classification.
+
+Q5. What is the vanishing gradient problem in LSTM and how is it solved?
+    In SimpleRNN, the gradient is multiplied by the recurrent weight
+    matrix at every time step, causing it to decay exponentially.
+    LSTM solves this with a CELL STATE that flows through the network
+    with minimal modification. The additive cell update (c_t = f_t *
+    c_{t-1} + i_t * c_tilde) allows gradients to flow back through
+    many time steps without decaying.
+
+Q6. What is the shape of the input tensor?
+    (batch_size, 130, 13). 130 time steps (frames) per 3-second segment,
+    with 13 MFCC features per frame.
+
+Q7. Why is the first LSTM layer set to return_sequences=True?
+    It outputs the hidden state at every time step, creating a sequence
+    of 130 vectors. This allows the second LSTM layer to process the
+    temporal evolution at a higher level of abstraction.
+
+Q8. How does the model predict the genre of a full 30-second song?
+    It extracts 10 segments from the song, predicts the class
+    probabilities for each segment, and averages them. The genre with
+    the highest average probability is chosen (mean pooling).
+
+Q9. Why normalize the MFCCs with StandardScaler?
+    Different MFCC coefficients have different scales (e.g., the 0th
+    coefficient represents overall energy and is much larger).
+    Normalization ensures all features contribute equally to the
+    gradients and stabilizes LSTM training.
+
+Q10. Which genres does the model confuse most, and why?
+    Rock and Metal (similar distorted guitars and drum patterns), and
+    Country and Blues (similar acoustic instrumentation and chord
+    progressions). Classical is rarely confused because it lacks
+    percussion and electronic elements.
+
+Q11. What happens if a track is shorter than 30 seconds?
+    The extraction function pads or truncates to 30s via librosa. If it
+    is too short to form a full 3-second segment, that segment is
+    skipped. The corrupt `jazz.00054.wav` file is caught by the
+    try/except block and ignored.
+
+Q12. Why use 13 MFCCs and not more?
+    The first 13 coefficients capture the overall spectral envelope
+    (timbre). Higher coefficients represent fine spectral details and
+    noise, which are less relevant for broad genre classification and
+    can introduce overfitting.
+
+Q13. What is the difference between segment-level and song-level accuracy?
+    Segment-level measures how often the model correctly classifies a
+    random 3-second clip. Song-level measures how often it correctly
+    classifies the entire track by aggregating evidence. Song-level
+    accuracy is always higher and more practically useful.
+
+Q14. Why use validation_split=0.15 during training?
+    It holds out 15% of the training segments to monitor overfitting
+    and trigger EarlyStopping. Ideally, this should also be song-split,
+    but segment-split is acceptable for internal validation during
+    training to save compute.
+
+Q15. How would you improve this LSTM model?
+    Use a CNN-LSTM hybrid (CRNN) to capture local spectrogram patterns
+    with Conv1D/Conv2D before passing them to the LSTM. Alternatively,
+    use Mel-spectrograms instead of MFCCs, or employ a Transformer
+    architecture with self-attention over the time steps.
+
+Q16. What do the saved artifacts (model and scaler) do?
+    The Keras model contains the trained LSTM weights. The pickle file
+    contains the mean and variance from the training data. Both are
+    required to preprocess and classify new, unseen audio files
+    correctly in production.
+
+Q17. Explain the LSTM gate equations in detail.
+    Forget gate: f_t = sigmoid(W_f * [h_{t-1}, x_t] + b_f)
+      Decides how much of the previous cell state to keep.
+    Input gate: i_t = sigmoid(W_i * [h_{t-1}, x_t] + b_i)
+      Decides how much new information to add.
+    Candidate: c_tilde = tanh(W_c * [h_{t-1}, x_t] + b_c)
+      Creates a candidate vector of new information.
+    Cell update: c_t = f_t * c_{t-1} + i_t * c_tilde
+      Combines the forget and input decisions to update the cell state.
+    Output gate: o_t = sigmoid(W_o * [h_{t-1}, x_t] + b_o)
+      Decides how much of the cell state to expose.
+    Hidden state: h_t = o_t * tanh(c_t)
+      Produces the final hidden state for this time step.
+
+Q18. What is the computational complexity of LSTM vs SimpleRNN?
+    LSTM has approximately 4x the parameters of SimpleRNN for the same
+    hidden size, because it has 4 weight matrices (forget, input,
+    candidate, output) instead of 1. However, the computational cost
+    is acceptable for the improved accuracy on long sequences.
+
+Q19. Why is LSTM better than GRU for this task?
+    GRU (Gated Recurrent Unit) is a simplified variant of LSTM with only
+    2 gates (reset and update) instead of 3. GRU is faster to train but
+    may not capture long-term dependencies as effectively as LSTM.
+    For 130 time steps (3 seconds of audio), LSTM's additional cell
+    state provides better memory retention.
+
+Q20. What is the role of the Dense(64, relu) layer after the LSTM?
+    The second LSTM outputs a 64-dimensional vector summarizing the
+    entire 3-second segment. The Dense(64, relu) layer adds non-linear
+    transformation and acts as a buffer before the final classification.
+    The Dropout(0.3) layer prevents overfitting by randomly zeroing 30%
+    of the activations during training.
+======================================================================

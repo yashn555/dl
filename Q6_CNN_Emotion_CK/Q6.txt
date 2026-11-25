@@ -1,0 +1,481 @@
+======================================================================
+PS6 : FACIAL EMOTION RECOGNITION USING CNN (CK+ DATASET)
+Notebook: ps06_ckplus_emotion_cnn.ipynb
+======================================================================
+
+----------------------------------------------------------------------
+1. PROBLEM STATEMENT (PS)
+----------------------------------------------------------------------
+Build a Convolutional Neural Network that detects emotions from facial
+images (happy, sad, angry, etc.) using the CK+ (Extended Cohn-Kanade)
+dataset.
+
+Task type : 7-class single-label image classification
+Input     : 48 x 48 grayscale face crop
+Output    : probabilities over
+            [anger, contempt, disgust, fear, happy, sadness, surprise]
+
+----------------------------------------------------------------------
+2. DATASET FACTS (CK+ / CK+48)
+----------------------------------------------------------------------
+Original CK+ database:
+  - 593 posed facial-behaviour sequences from 123 subjects
+  - each sequence goes from neutral frame -> apex (peak expression)
+  - only 327 sequences carry a validated emotion label
+  - 7 labelled emotions + a "neutral" state; contempt is unique to CK+
+    (it is absent from FER-2013)
+
+CK+48 image variant used here:
+  - the LAST 3 frames of each of the 327 labelled sequences
+    -> 327 x 3 = 981 images, already cropped/aligned to 48x48 grayscale
+  - organised as one folder per emotion
+
+Typical class distribution (981 images):
+    anger      135
+    contempt    54   <-- smallest class
+    disgust    177
+    fear        75
+    happy      207
+    sadness     84
+    surprise   249   <-- largest class
+(the notebook prints the exact counts it finds)
+
+THE CRITICAL ISSUE WITH CK+
+  981 images come from only ~123 people, and the 3 frames of one
+  sequence are nearly identical. A plain random image-level split puts
+  almost-duplicate frames of the SAME PERSON in both training and test.
+  The network then partly recognises the PERSON, not the emotion, and
+  reports 97-99% accuracy that does not generalise to new faces.
+  This is called subject leakage (identity leakage).
+
+  Correct protocol: SUBJECT-INDEPENDENT split - all frames of a person
+  belong to exactly one of train / validation / test.
+
+----------------------------------------------------------------------
+3. WHAT THIS NOTEBOOK DOES
+----------------------------------------------------------------------
+Cell 1 : imports, configuration, device report. Enables GPU memory
+         growth and prints GPU name + total/free VRAM. CK+ is tiny
+         (~9 MB of pixels), so this is an INFORMATION cell, not a
+         blocking gate: CPU training also completes in minutes.
+Cell 2 : dataset acquisition (kagglehub auto-download, or a local
+         DATA_DIR), locates the emotion-folder root, lists every image
+         path and its integer label.
+Cell 3 : THE SPLIT. Extracts subject IDs (pattern S###, e.g. S010_004_...)
+         from filenames.
+           - If every file has a subject ID -> SUBJECT-INDEPENDENT split
+             of the subjects themselves: 70% train / 15% val / 15% test.
+           - Otherwise -> stratified random 70/15/15 split, with an
+             explicit printed warning that scores will be optimistic.
+Cell 4 : tf.data pipelines (decode -> resize -> cache -> shuffle ->
+         batch -> prefetch) and balanced class weights.
+Cell 5 : EDA - training class histogram and 7 sample faces.
+Cell 7 : the CNN (3 conv blocks with BatchNorm + GlobalAveragePooling).
+Cell 9 : training with class weights and 3 callbacks.
+Cell 11: ONE-TIME evaluation on the untouched test split + curves.
+Cell 12: classification report, macro F1, confusion matrix.
+Cell 13: 8 test faces with predicted vs actual labels.
+Cell 15: save the model + a single-image inference helper.
+
+The notebook code contains no comments; all explanation lives here.
+
+----------------------------------------------------------------------
+4. HOW TO RUN
+----------------------------------------------------------------------
+Requirements: TensorFlow >= 2.13, numpy, matplotlib, seaborn,
+scikit-learn, kagglehub (only for auto-download).
+
+ 1. Colab: Runtime > Change runtime type > T4 GPU (optional - CPU works).
+ 2. Dataset, either:
+      a) auto-download (DATA_DIR = None): add a Kaggle API token as a
+         Colab Secret named KAGGLE_API_TOKEN. If the configured slug is
+         unavailable, the cell prints instructions and stops cleanly.
+      b) manual: set DATA_DIR in Cell 1 to a folder containing the 7
+         emotion subfolders of CK+48.
+ 3. Runtime > Run all.
+
+Runtime: T4 ~2-4 s/epoch -> a few minutes for up to 80 epochs.
+CPU ~10-25 s/epoch -> roughly 15-35 minutes. Peak VRAM: a few hundred MB.
+
+----------------------------------------------------------------------
+5. CELL-BY-CELL CODE COMMENTS
+----------------------------------------------------------------------
+
+--- Cell 1: setup + device report -------------------------------------
+pathlib / re            : paths and subject-ID regex
+subprocess              : nvidia-smi query for VRAM numbers
+numpy / matplotlib / seaborn
+sklearn metrics         : report, confusion matrix, macro F1
+train_test_split        : fallback stratified split
+compute_class_weight    : imbalance handling
+keras / layers          : model API
+
+DATA_DIR = None         : None -> auto-download; else a local path
+KAGGLE_DATASET          : dataset slug used by kagglehub
+IMG = (48, 48)          : native CK+48 resolution
+BATCH = 32              : small batch suits ~690 training images
+EPOCHS = 80             : upper bound; EarlyStopping decides
+SEED = 42               : keras.utils.set_random_seed seeds Python,
+                          NumPy and TensorFlow together
+
+set_memory_growth(True) : allocate VRAM on demand instead of reserving
+                          the whole GPU; try/except makes re-runs safe.
+nvidia-smi              : prints total/free VRAM when available.
+No SystemExit here      : this workload is CPU-viable, so the cell only
+                          informs. (Hard GPU gates are reserved for
+                          heavy jobs such as YOLO or large fine-tuning.)
+
+--- Cell 2: dataset acquisition and file inventory --------------------
+kagglehub.dataset_download(...)  # cached download, returns root path
+# on failure: boxed message with two fixes, then SystemExit (fail fast
+# with guidance instead of a cryptic NotFoundError later)
+
+root.rglob('surprise')  # find the emotion-folder root regardless of how
+                        # the archive was nested; fall back to root
+class_dirs = sorted(subdirectories)   # alphabetical -> anger=0 ...
+class_names, num_classes              # 7 emotions
+
+# Build a flat inventory: paths[] (strings) and labels[] (ints).
+# Working with file PATHS (not a pre-loaded directory dataset) is what
+# makes the subject-aware split in the next cell possible.
+
+--- Cell 3: subject-independent split (the key correctness step) ------
+pattern = re.compile(r'[Ss]\d{3}')
+# CK+ filenames look like S010_004_00000019.png -> subject S010,
+# sequence 004, frame 19. We only need the subject part.
+
+subjects[i] = matched ID uppercased, or None if the filename has no ID
+subject_split = all IDs present?
+
+IF subject IDs exist:
+    unique = sorted list of distinct subjects, shuffled with SEED
+    70% of SUBJECTS -> train, next 15% -> val, last 15% -> test
+    masks built by membership of each image's subject in those sets
+    => no person appears in two splits; no near-duplicate frames leak.
+ELSE:
+    stratified train_test_split twice (70/15/15, stratify=labels)
+    prints an explicit warning that the score is optimistic.
+
+# Printing the split mode makes the evaluation protocol auditable -
+# always state which mode produced your reported accuracy.
+
+--- Cell 4: input pipeline + class weights ----------------------------
+load_image(path, label):
+    tf.io.read_file        -> raw bytes
+    tf.io.decode_image(channels=1, expand_animations=False)
+                           -> grayscale tensor (PNG or JPEG)
+    tf.image.resize(IMG)   -> 48x48 (no-op if already 48x48)
+    cast to float32        -> pixels still in [0,255]; the model's
+                              Rescaling layer handles normalisation
+
+make_ds(mask, training):
+    from_tensor_slices((paths[mask], labels[mask]))
+    .map(load_image, num_parallel_calls=AUTOTUNE)   # parallel decode
+    .cache()          # decode ONCE; whole dataset is only ~9 MB
+    .shuffle(1024)    # AFTER cache, so order re-randomises every epoch
+    .batch(BATCH).prefetch(AUTOTUNE)   # overlap input with GPU compute
+    val/test: no shuffle -> stable order so labels align with predictions
+
+compute_class_weight('balanced') -> w_c = N / (K * N_c)
+    contempt/fear/sadness get larger weights, surprise/happy smaller,
+    so rare emotions are not ignored by the loss.
+
+--- Cell 5: EDA -------------------------------------------------------
+np.bincount(y_train) + bar chart -> shows the imbalance numerically
+7 sample faces with labels       -> sanity check that decoding,
+                                    grayscale conversion and label
+                                    mapping are all correct
+
+--- Cell 7: the CNN ---------------------------------------------------
+Input(48,48,1)
+Rescaling(1/255)          : [0,255] -> [0,1], baked into the model so
+                            deployment needs no manual preprocessing
+RandomFlip('horizontal')  : mirroring preserves emotion
+RandomRotation(0.08)      : small head tilts (~+/-29 degrees)
+RandomZoom(0.1)           : +/-10% scale
+RandomTranslation(0.05)   : small shifts, mimics imperfect face crops
+# All four are TRAINING-ONLY; identity at validation/inference, and
+# they still randomise every epoch even though the dataset is cached.
+
+Block 1: Conv2D(32,3,same,use_bias=False) -> BN -> ReLU -> MaxPool  48->24
+Block 2: Conv2D(64,3,same,use_bias=False) -> BN -> ReLU -> MaxPool  24->12
+Block 3: Conv2D(128,3,same,use_bias=False)-> BN -> ReLU -> MaxPool  12->6
+GlobalAveragePooling2D()  : 6x6x128 -> 128 (average each channel)
+Dropout(0.4)
+Dense(7, softmax)
+
+Parameter budget:
+    conv1  3*3*1*32   =    288
+    conv2  3*3*32*64  = 18,432
+    conv3  3*3*64*128 = 73,728
+    BN (trainable gamma+beta) 2*(32+64+128) = 448
+    BN (non-trainable moving mean/var)      = 448
+    Dense  128*7 + 7  =    903
+    TOTAL             = 94,247   (trainable 93,799)
+
+Why GlobalAveragePooling instead of Flatten?
+    Flatten gives 6*6*128 = 4,608 features; a Dense(128) on top would
+    cost 589,952 parameters - roughly 6x the entire rest of the network,
+    trained on only ~690 images. GAP has ZERO parameters, forces each
+    channel to represent a global expression cue, and is a strong
+    regulariser. This single choice is the main defence against
+    overfitting on a dataset this small.
+
+compile: Adam(1e-3), sparse_categorical_crossentropy (integer labels),
+         metrics=['accuracy'].
+
+--- Cell 9: training --------------------------------------------------
+ModelCheckpoint('best_ckplus_cnn.keras', monitor='val_accuracy',
+                save_best_only=True)     # disconnect insurance
+ReduceLROnPlateau(factor=0.5, patience=6, min_lr=1e-6)
+                                         # refine when val_loss stalls
+EarlyStopping(monitor='val_loss', patience=15, restore_best_weights=True)
+                                         # generous patience: with only
+                                         # ~100 validation images the
+                                         # metric is noisy epoch to epoch
+model.fit(..., class_weight=class_weight)
+                                         # each sample's loss scaled by
+                                         # its class weight
+# The TEST split is never passed to fit or to any callback.
+
+--- Cell 11: final evaluation + curves --------------------------------
+model.evaluate(test_ds)   # the ONE and ONLY use of the test split
+# prints accuracy and cross-entropy loss (loss is NOT a percentage)
+# train vs validation curves show convergence and any overfitting gap
+
+--- Cell 12: per-class report + confusion matrix ----------------------
+y_true collected from the unshuffled test_ds -> aligns with predictions
+classification_report(labels=range(7), zero_division=0)
+    # labels=... guarantees all 7 rows even if a class is absent from
+    # this particular test split; zero_division=0 silences the
+    # "precision ill-defined" warning for unpredicted classes
+f1_score(average='macro')  # single balanced headline number
+confusion_matrix heatmap   # rows actual, columns predicted
+
+--- Cell 13: qualitative check ----------------------------------------
+8 test faces titled P:<prediction> / A:<actual>, green = correct,
+red = wrong -> quick visual error analysis
+
+--- Cell 15: save + inference -----------------------------------------
+model.save('ckplus_cnn_final.keras')   # self-contained: includes
+                                       # Rescaling and (inert) augmentation
+predict_image(path):
+    load_img(grayscale, 48x48) -> img_to_array -> [None,...] batch axis
+    model.predict -> 7 probabilities; shows the face with the winning
+    emotion and confidence; returns {emotion: probability}
+    # For real photos, crop the face tightly first - CK+ images are
+    # aligned face crops, not full scenes.
+
+----------------------------------------------------------------------
+6. MODEL THEORY
+----------------------------------------------------------------------
+6.1 Why a CNN?
+    Expression is defined by local geometry: brow angle, mouth corners,
+    eye aperture. Convolutions learn small spatial filters that are
+    reused everywhere (weight sharing, translation equivariance), so a
+    "raised eyebrow" detector works at any position. Stacked blocks
+    build a hierarchy: edges -> facial parts -> expression configuration.
+
+6.2 Convolution arithmetic
+    Params = K*K*C_in*C_out (+C_out if bias). With padding='same' the
+    spatial size is preserved inside a block; MaxPooling(2x2) does the
+    downsampling (48->24->12->6) and adds mild translation invariance.
+
+6.3 BatchNormalization
+    y = gamma * (x - mu_B)/sqrt(var_B + eps) + beta, per channel, using
+    batch statistics during training and moving averages at inference.
+    Stabilises and speeds up training, permits a higher learning rate,
+    and acts as mild regularisation. Placed BEFORE ReLU (Conv->BN->ReLU)
+    so pre-activations stay centred. use_bias=False in the preceding
+    conv because BN's beta already supplies the shift and mean
+    subtraction would cancel any conv bias anyway.
+    With BATCH=32 the batch statistics are noisy - one more reason GAP
+    + dropout + augmentation matter here.
+
+6.4 GlobalAveragePooling vs Flatten
+    GAP averages each of the 128 final feature maps to a single number.
+    Zero parameters, spatially robust, and it removes the ~590k-parameter
+    dense layer that would otherwise dominate the model and memorise
+    the 690 training faces.
+
+6.5 Dropout(0.4)
+    Randomly zeroes 40% of the pooled features during training,
+    preventing co-adaptation. Disabled automatically at inference.
+
+6.6 Augmentation on a tiny dataset
+    With <700 training images, augmentation is effectively data
+    multiplication. Flip/rotate/zoom/translate are label-preserving for
+    faces; vertical flip or heavy warping would destroy the geometry
+    that defines an expression, so they are deliberately excluded.
+
+6.7 Class imbalance
+    contempt (54) vs surprise (249) is ~4.6x. Balanced weights
+    w_c = N/(K*N_c) equalise each class's expected contribution to the
+    loss. Expect minority-class RECALL to rise and PRECISION to fall
+    slightly; macro F1 is the metric that improves.
+
+6.8 Loss / optimiser
+    softmax -> 7 probabilities; sparse categorical cross-entropy
+    = -log p(true class) with integer labels (no one-hot needed).
+    Adam(1e-3) adapts per-parameter step sizes; ReduceLROnPlateau halves
+    it when validation loss plateaus.
+
+6.9 Why CK+ scores are much higher than FER-2013
+    CK+ is lab-controlled: frontal, posed, well-lit, aligned, apex-frame
+    expressions with clean labels. FER-2013 is in-the-wild, noisy and
+    crowd-labelled (human accuracy ~65%). So 85-95% on CK+ versus 60-65%
+    on FER-2013 is expected - it reflects dataset difficulty, not a
+    better model. The honest CK+ number is the SUBJECT-INDEPENDENT one.
+
+6.10 Evaluation metrics
+    Precision = TP/(TP+FP); Recall = TP/(TP+FN); F1 = harmonic mean.
+    Macro average weights every class equally (important with 54
+    contempt images); weighted average weights by support.
+    With ~140 test images, one image is worth ~0.7 percentage points,
+    so treat small differences between runs as noise. Subject-wise
+    k-fold cross-validation is the rigorous way to report CK+ results.
+
+----------------------------------------------------------------------
+7. EXPECTED RESULTS (approximate)
+----------------------------------------------------------------------
+Subject-independent split (the honest protocol):
+    Test accuracy ~0.80 - 0.92
+    Macro F1      ~0.75 - 0.90
+    happy / surprise / disgust: strong (often 0.90+)
+    contempt: weakest and most variable (very few examples)
+    fear / sadness: moderate, sometimes confused with each other
+    Training typically stops between epoch 35 and 80.
+
+Stratified-random fallback (subject IDs missing):
+    Test accuracy ~0.95 - 0.99 - INFLATED by identity leakage.
+    If you report this number, you must state the split protocol.
+
+A small train/test gap is normal here; a large gap means the model is
+memorising identities, which the subject-independent split exposes.
+
+----------------------------------------------------------------------
+8. VIVA QUESTIONS AND ANSWERS
+----------------------------------------------------------------------
+Q1. What does this project do?
+    Trains a CNN to classify 48x48 grayscale CK+ face crops into 7
+    emotions and evaluates it on a held-out set of subjects.
+
+Q2. Describe the CK+ dataset.
+    593 posed sequences from 123 subjects; 327 have validated emotion
+    labels. The CK+48 variant takes the last 3 frames of each labelled
+    sequence -> 981 aligned 48x48 grayscale images across 7 emotions,
+    including contempt.
+
+Q3. Why is CK+ "easier" than FER-2013?
+    Controlled lab conditions, frontal posed apex expressions, clean
+    expert labels, aligned crops. FER-2013 is in-the-wild with noisy
+    crowd labels and ~65% human accuracy.
+
+Q4. What is subject leakage and why does it matter here?
+    The 3 frames of one sequence are near-duplicates of the same person.
+    A random image split puts them in both train and test, so the model
+    can score high by recognising identity rather than emotion. Reported
+    accuracy then collapses on new people.
+
+Q5. How does this notebook prevent it?
+    It parses subject IDs (S###) from filenames and splits the SUBJECTS
+    70/15/15, so every person's frames live in exactly one split. If IDs
+    are unavailable it falls back to a stratified split and prints a
+    warning.
+
+Q6. Why three splits rather than two?
+    Validation drives early stopping, LR reduction and checkpointing.
+    Using the test set for those decisions biases the final number.
+    Here the test split is evaluated exactly once, at the end.
+
+Q7. Why is the model only ~94k parameters?
+    Because there are only ~690 training images. GAP replaces the
+    589,952-parameter Flatten->Dense layer, keeping capacity proportional
+    to the data and limiting overfitting.
+
+Q8. Explain GlobalAveragePooling2D.
+    Averages each 6x6 feature map to one value, giving a 128-d vector.
+    No parameters, translation-robust, and a strong regulariser compared
+    with flattening all spatial positions.
+
+Q9. What does BatchNormalization do, and why before ReLU?
+    Normalises each channel with batch statistics then rescales with
+    learnable gamma/beta (moving averages at inference). Before ReLU it
+    keeps pre-activations centred, stabilising gradients and allowing a
+    larger learning rate.
+
+Q10. Why use_bias=False in the conv layers?
+    BN subtracts the mean, cancelling a conv bias, and its beta provides
+    the shift - the bias would be a redundant parameter.
+
+Q11. Which augmentations are used and why not vertical flip?
+    Horizontal flip, small rotation, zoom and translation - all
+    label-preserving for faces. An upside-down face is not a realistic
+    variation and destroys the geometry that defines an expression.
+
+Q12. How is class imbalance handled?
+    Balanced class weights w_c = N/(K*N_c) passed to fit, so contempt
+    (~54 images) influences the loss as much as surprise (~249).
+
+Q13. Why sparse_categorical_crossentropy?
+    Labels are integer class ids, so no one-hot encoding is required;
+    it computes -log p(true class) and pairs correctly with softmax.
+
+Q14. Why is EarlyStopping patience 15 here but smaller elsewhere?
+    The validation split has only ~100 images, so val_loss fluctuates a
+    lot between epochs. A longer patience avoids stopping on noise.
+
+Q15. Why cache() before shuffle()?
+    Caching stores decoded tensors so image decoding happens once;
+    shuffling after the cache still re-randomises order every epoch.
+    prefetch overlaps input preparation with GPU computation.
+
+Q16. Which metric would you report and why?
+    Macro F1 with the confusion matrix (plus accuracy for reference),
+    because imbalance makes plain accuracy hide failure on contempt.
+    And always state that the split is subject-independent.
+
+Q17. How do you read the confusion matrix here?
+    Rows = actual emotion, columns = predicted; the diagonal is correct.
+    Typical confusions: fear<->sadness, anger<->disgust; contempt is
+    often missed because it is subtle and rare.
+
+Q18. Why is there no hard GPU/VRAM gate in this notebook?
+    The whole dataset is ~9 MB of pixels and the model is ~94k
+    parameters, so it trains in minutes on CPU. The first cell reports
+    GPU/VRAM and enables memory growth, but blocking execution would be
+    unnecessary. Hard gates are used for genuinely heavy workloads.
+
+Q19. How would you make the evaluation even more rigorous?
+    Subject-wise k-fold (e.g. 10-fold) cross-validation, reporting mean
+    +/- std of macro F1 across folds; with 123 subjects a single split
+    is high-variance.
+
+Q20. How would you improve accuracy?
+    More data (combine with FER-2013/RAF-DB), transfer learning from an
+    ImageNet or FER-pretrained backbone, stronger augmentation, label
+    smoothing, or modelling the sequence (neutral->apex) with a
+    CNN+LSTM instead of single frames.
+
+Q21. How is the saved model reused?
+    keras.models.load_model('best_ckplus_cnn.keras'); it contains the
+    Rescaling layer, so predict directly on a (N,48,48,1) batch of face
+    crops - exactly what predict_image() does for one file.
+
+----------------------------------------------------------------------
+9. QUICK TROUBLESHOOTING
+----------------------------------------------------------------------
+"DATASET DOWNLOAD FAILED"  -> add KAGGLE_API_TOKEN, or set DATA_DIR to a
+                              local CK+48 folder with 7 emotion subfolders.
+"no subject IDs found"     -> your copy uses renamed files; the notebook
+                              falls back to a stratified split. Report the
+                              protocol, or rename files to S###_... to
+                              enable the subject-independent split.
+Very high accuracy (99%)   -> check the printed split mode; it is probably
+                              the leaky random fallback.
+ contempt row all zeros    -> too few contempt samples in this split;
+                              use class weights (already on) and k-fold.
+Slow epochs                -> you are on CPU; switch to a GPU runtime.
+Re-running Cell 1          -> memory growth is wrapped in try/except, so
+                              it is safe to re-run.
+======================================================================
