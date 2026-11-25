@@ -1,0 +1,305 @@
+PS1 — BASIC CNN FOR HANDWRITTEN DIGIT CLASSIFICATION (MNIST)
+Notebook: ps01_cnn_mnist.ipynb
+============================================================
+
+1. PROBLEM STATEMENT & OBJECTIVE
+--------------------------------
+PS1: "Implement a basic CNN for classifying handwritten digits."
+
+Goal: build, train and evaluate a Convolutional Neural Network that takes a
+28x28 grayscale image of a handwritten digit and predicts which digit (0-9)
+it is. This is a 10-class, single-label image classification problem.
+
+What a complete solution must demonstrate:
+  - loading and preprocessing image data (scaling, channel dimension)
+  - a CNN architecture (convolution + pooling + dense classifier head)
+  - a correct loss/optimizer pairing for multi-class labels
+  - training with a held-out validation set (not the test set)
+  - quantitative evaluation (accuracy, loss, per-class metrics, confusion matrix)
+  - qualitative checks (sample images with predicted vs actual labels)
+This notebook covers all of the above, plus reproducibility, checkpointing and
+saving of the trained model.
+
+2. DATASET
+----------
+MNIST (Modified National Institute of Standards and Technology database).
+  - 60,000 training images, 10,000 test images
+  - 28 x 28 pixels, single channel (grayscale), pixel values 0-255 (uint8)
+  - 10 classes, labels are integers 0-9
+  - roughly class-balanced (~5,400-6,700 samples per digit in train)
+  - download size ~11 MB; fetched automatically by keras.datasets.mnist and
+    cached in ~/.keras/datasets after the first run
+  - already shuffled, so a simple tail split for validation is safe
+
+Memory footprint after preprocessing: 70,000 x 28 x 28 x 1 float32 ~ 220 MB.
+This is why the whole dataset can live in RAM and no data generator is needed.
+
+3. MODEL THEORY
+---------------
+3.1 Why a CNN instead of a plain dense network?
+  - Local receptive fields: a neuron looks at a small neighbourhood (3x3),
+    which is where the meaningful structure of a digit lives (edges, curves,
+    stroke endings).
+  - Weight sharing: the same filter slides over the whole image, so a "vertical
+    stroke" detector learned in one position works everywhere. This cuts the
+    parameter count enormously compared with a fully connected layer on raw
+    pixels (784 inputs -> 128 units would already be ~100k weights with no
+    spatial understanding).
+  - Translation equivariance: shifting the digit shifts the feature maps rather
+    than destroying the representation.
+  - Hierarchical features: layer 1 learns edges/strokes; layer 2 composes them
+    into loops, corners and junctions; the dense head combines that evidence
+    into a digit decision.
+
+3.2 Building blocks used
+  - Conv2D(filters, kernel_size=3, activation='relu'): each filter is a 3x3
+    learnable kernel (+bias) convolved across the input; produces one feature
+    map per filter. 'valid' padding (the default) means no border padding, so
+    the spatial size shrinks by 2 each time (28->26, 13->11).
+  - ReLU: f(x)=max(0,x). Cheap, non-saturating for positive values, keeps
+    gradients healthy; introduces the non-linearity that lets stacked layers
+    model more than a single linear map.
+  - MaxPooling2D(2x2): takes the maximum in each non-overlapping 2x2 window.
+    Halves height and width, reduces computation, and gives small local
+    translation invariance (a stroke shifted by one pixel often survives).
+  - Flatten: unrolls the final 5x5x64 feature maps into a 1600-length vector so
+    a dense classifier can reason over all positions together.
+  - Dropout(0.3): during training only, randomly zeroes 30% of the vector's
+    entries (and rescales the rest). Prevents units from co-adapting, i.e.
+    regularizes against overfitting. At inference it is an identity operation.
+  - Dense(128, relu): fully connected hidden layer that mixes global evidence.
+  - Dense(10, softmax): outputs a probability distribution over the 10 digits;
+    softmax exponentiates and normalizes the 10 logits so they sum to 1.
+
+3.3 Architecture and parameter count
+  Layer                     Output shape      Params    Role
+  ------------------------  ----------------  --------  ------------------------
+  Input                     (None,28,28,1)         0    grayscale digit
+  Conv2D 32, 3x3, relu      (None,26,26,32)      320    edge/stroke detectors
+  MaxPooling2D 2x2          (None,13,13,32)        0    downsample
+  Conv2D 64, 3x3, relu      (None,11,11,64)   18,496    stroke motifs / loops
+  MaxPooling2D 2x2          (None, 5, 5,64)        0    downsample
+  Flatten                   (None,1600)            0    vectorize
+  Dropout 0.3               (None,1600)            0    regularization
+  Dense 128, relu           (None,128)       204,928    global feature mixing
+  Dense 10, softmax         (None,10)          1,290    class probabilities
+  ------------------------  ----------------  --------  ------------------------
+  TOTAL                                        225,034    (~879 KB of weights)
+
+  "None" is the batch dimension. Parameter formulas:
+    Conv2D:  (k*k*in_channels + 1) * filters
+             (3*3*1 + 1)*32 = 320 ; (3*3*32 + 1)*64 = 18,496
+    Dense:   (in_units + 1) * out_units
+             (1600+1)*128 = 204,928 ; (128+1)*10 = 1,290
+  Note that ~91% of all parameters sit in the Flatten->Dense(128) connection.
+  That is typical for this classic MNIST design; a GlobalAveragePooling2D head
+  would remove most of them, but is unnecessary at this scale.
+
+3.4 Loss, optimizer, metric
+  - Loss = sparse_categorical_crossentropy. "Sparse" means the targets are
+    integer class indices (0-9) rather than one-hot vectors, so no label
+    expansion is needed. For a sample with true class c the loss is -log(p_c),
+    i.e. it punishes low probability assigned to the correct digit. This is the
+    correct pairing for a softmax output with mutually exclusive classes.
+  - Optimizer = Adam (default learning rate 0.001). Adaptive per-parameter
+    step sizes with momentum; robust and near-tuning-free for small CNNs.
+  - Metric = accuracy (fraction of correct argmax predictions).
+
+3.5 Training protocol
+  - 60,000 training images split 90/10 -> 54,000 train + 6,000 validation.
+    Batch size 128 -> 422 gradient updates per epoch.
+  - The 10,000-image test set is used exactly once, at the end, for the final
+    report. It never influences training, early stopping, or LR scheduling.
+  - Three callbacks control the run:
+      ModelCheckpoint   - writes best_model.keras whenever val_accuracy
+                          improves, so the best state survives a crash.
+      ReduceLROnPlateau - halves the learning rate if val_loss has not improved
+                          for 2 epochs (floor 1e-5), helping fine convergence.
+      EarlyStopping     - stops when val_accuracy has not improved for 3 epochs
+                          and restores the best weights seen.
+  - EPOCHS = 15 is therefore an upper bound, not a fixed cost.
+
+4. CODE EXPLANATION (cell by cell; code cells numbered 1-11)
+------------------------------------------------------------
+The notebook code is intentionally comment-free; this section is the commentary.
+
+Cell 1 — Imports, configuration, reproducibility
+  Imports: os (paths), numpy (arrays), pandas (CSV log), matplotlib + seaborn
+  (plots), tensorflow/keras + layers (model), sklearn metrics (report, matrix).
+  SEED = 42, BATCH_SIZE = 128, EPOCHS = 15, SAVE_TO_DRIVE = False.
+  keras.utils.set_random_seed(SEED) sets the Python, NumPy and TensorFlow seeds
+  in one call, so weight initialization and shuffling repeat across runs.
+  SAVE_TO_DRIVE stays False by default so the notebook runs start-to-finish
+  without any authentication prompt.
+
+Cell 2 — Device info and GPU memory growth
+  tf.config.list_physical_devices('GPU') lists visible GPUs. For each one,
+  set_memory_growth(g, True) makes TensorFlow allocate VRAM incrementally
+  instead of reserving nearly all of it at startup. This must run before any
+  GPU tensor exists, which is why it sits immediately after the imports.
+  If a GPU is present, pynvml (NVIDIA management library, preinstalled on
+  Colab) prints total and free VRAM; it is wrapped in try/except so the cell
+  still works on machines without it.
+  If no GPU is found, the cell just says so and continues: this task needs well
+  under 1 GB of VRAM and runs fine on CPU, only slower. Nothing is terminated.
+
+Cell 3 — Output directory and checkpoint path
+  OUT_DIR defaults to the local folder 'outputs'. If SAVE_TO_DRIVE is True,
+  Google Drive is mounted at /content/drive and OUT_DIR becomes
+  MyDrive/ps01_mnist, so artifacts survive a Colab disconnect.
+  os.makedirs(..., exist_ok=True) creates the folder idempotently.
+  CKPT_PATH = OUT_DIR/best_model.keras is where the best weights will be written
+  during training.
+
+Cell 4 — Load and preprocess the data
+  keras.datasets.mnist.load_data() returns (x_train,y_train),(x_test,y_test).
+  .astype('float32') converts uint8 to float so division produces fractions;
+  /255.0 scales pixels into [0,1], which keeps activations and gradients
+  well-conditioned. [..., None] appends a channel axis, giving (N,28,28,1) as
+  required by Conv2D. Labels remain integers (sparse format).
+  The printed shapes should read: Train (60000,28,28,1), Test (10000,28,28,1).
+  The 8-image strip is a sanity check that images and labels line up.
+
+Cell 5 — Define and compile the CNN
+  keras.Sequential stacks the layers listed in section 3.3, starting with an
+  explicit layers.Input((28,28,1)) so the model is built immediately and
+  summary() can show real shapes.
+  compile() attaches Adam, sparse_categorical_crossentropy and accuracy.
+  summary() prints the layer table and the 225,034 trainable parameters.
+
+Cell 6 — Train
+  Builds the three callbacks (checkpoint, LR scheduler, early stopping) and
+  calls model.fit with validation_split=0.1, batch_size=128, epochs=15,
+  verbose=2 (one line per epoch).
+  Keras holds out the LAST 10% of the training array before shuffling; MNIST is
+  already shuffled, so that tail is class-balanced in practice.
+  Each printed line shows train accuracy/loss and val_accuracy/val_loss.
+  Watch for: val_accuracy rising then flattening (normal), and the learning
+  rate dropping when ReduceLROnPlateau triggers.
+
+Cell 7 — Final test evaluation and learning curves
+  model.evaluate(x_test, y_test) is the single, honest measurement on unseen
+  data; both loss and accuracy are printed as plain numbers (loss is a
+  cross-entropy value, NOT a percentage).
+  Two side-by-side plots show train vs validation loss and accuracy per epoch.
+  A widening train/val gap indicates overfitting; here both curves stay close.
+
+Cell 8 — Per-class report and confusion matrix
+  model.predict(x_test) returns a (10000,10) probability matrix; .argmax(axis=1)
+  converts each row to the predicted digit.
+  classification_report prints precision, recall, F1 and support per digit,
+  plus macro and weighted averages (digits=4 for four decimal places).
+  The heatmap of confusion_matrix shows actual classes as rows and predicted
+  classes as columns; the diagonal holds correct predictions, off-diagonal
+  cells are the mistakes.
+
+Cell 9 — Visual check on test images
+  Displays the first 8 test digits titled "P:<prediction> A:<actual>", a quick
+  qualitative confirmation that the model behaves sensibly.
+
+Cell 10 — Single-image demo
+  Picks image_index (default 0), takes that test image, expands it to a batch of
+  one with np.expand_dims, and runs predict. Prints the true label, the
+  predicted label and the softmax confidence (probability of the winning class),
+  then displays the image with both labels in the title.
+  Change image_index and re-run just this cell to demo any test digit.
+
+Cell 11 — Save the model and the training log
+  model.save(OUT_DIR/final_model.keras) stores the end-of-run model (architecture
+  + weights + optimizer state) in the modern .keras format.
+  pd.DataFrame(history.history).to_csv(...) writes every epoch's metrics to
+  training_log.csv, ready for a lab report or an external plot.
+  Both paths are printed for confirmation.
+
+5. HOW TO RUN
+-------------
+On Google Colab (recommended):
+  1. File -> Upload notebook -> select ps01_mnist_final.ipynb
+  2. Runtime -> Change runtime type -> T4 GPU -> Save
+     (a CPU runtime also works; it is simply slower)
+  3. Optional: in Cell 1 set SAVE_TO_DRIVE = True if you want the model and log
+     saved to your Google Drive; Cell 3 will then ask for authorization.
+  4. Runtime -> Run all.
+  5. The first run downloads MNIST (~11 MB); later runs use the cache.
+  6. Collect the artifacts from outputs/ (or MyDrive/ps01_mnist).
+
+Locally (Jupyter / VS Code):
+  - Requirements: TensorFlow >= 2.13, numpy, pandas, matplotlib, seaborn,
+    scikit-learn. pynvml is optional (only used for the VRAM printout).
+  - Open the notebook and run all cells. No Colab-specific code executes unless
+    SAVE_TO_DRIVE is True.
+
+Reusing the trained model later:
+  from tensorflow import keras
+  model = keras.models.load_model('outputs/best_model.keras')
+  probs = model.predict(some_batch)      # shape (N, 10)
+  digits = probs.argmax(axis=1)
+
+6. OUTPUTS / ARTIFACTS
+----------------------
+  outputs/best_model.keras   best weights by validation accuracy (from training)
+  outputs/final_model.keras  model at the end of the run
+  outputs/training_log.csv   per-epoch accuracy, loss, val_accuracy, val_loss
+                             and learning rate
+  On-screen: sample digit strip, model summary, epoch logs, test accuracy/loss,
+  loss & accuracy curves, classification report, confusion matrix, an 8-image
+  prediction strip, and a single-image demo with confidence.
+
+7. EXPECTED RESULTS & RUNTIME
+-----------------------------
+  Test accuracy: ~99.0 - 99.3%   Test loss: ~0.02 - 0.04
+  Training usually stops around epoch 8-13 via EarlyStopping (15 is the cap).
+  Validation accuracy typically reaches ~99.0-99.2%.
+  Peak VRAM: well under 1 GB at batch 128.
+  Runtime: Colab T4 ~2-4 min | RTX 3050 4 GB ~2-4 min | CPU only ~10-25 min.
+  Frequent confusion pairs (visible in the matrix): 4<->9, 3<->5, 7<->2, 8<->3.
+  Anything in this range is a correct, healthy result for this architecture.
+
+8. UNDERSTANDING THE EVALUATION METRICS
+---------------------------------------
+  Precision (per digit) = TP / (TP + FP): of all images predicted as this digit,
+    how many really were that digit.
+  Recall (per digit)    = TP / (TP + FN): of all real instances of this digit,
+    how many were found.
+  F1 = harmonic mean of precision and recall; a single balanced score.
+  Support = number of true test samples of that digit.
+  Macro average = unweighted mean over the 10 classes (treats all digits equally).
+  Weighted average = mean weighted by support.
+  Confusion matrix: rows = actual, columns = predicted; diagonal = correct.
+  Accuracy alone is acceptable here because MNIST is nearly balanced, but the
+  per-class report is what reveals WHICH digits are still being confused.
+
+9. TROUBLESHOOTING
+------------------
+  "No GPU found..." message         Normal. Either continue on CPU or switch the
+                                    runtime to GPU and re-run.
+  Error saving '.keras' file        TensorFlow is older than 2.13; upgrade, or
+                                    change the filenames to '.h5'.
+  Drive mount asks for permission   Expected when SAVE_TO_DRIVE = True; approve
+                                    it, or set the flag back to False.
+  Colab disconnected mid-run        Reconnect and re-run; if SAVE_TO_DRIVE was
+                                    True, best_model.keras is already on Drive.
+  Accuracy differs slightly between runs
+                                    GPU kernels are not fully deterministic;
+                                    expect about +/-0.1%.
+  Training stops before epoch 15    EarlyStopping working as intended; the best
+                                    weights were restored automatically.
+  Out-of-memory on GPU              Very unlikely here; if it happens, restart
+                                    the session to clear stale tensors, or lower
+                                    BATCH_SIZE to 64.
+
+10. NOTES & CAVEATS
+-------------------
+  - Do not tune anything against the test set. Use validation accuracy for
+    decisions; the test set exists only for the final number you report.
+  - Seeds make runs nearly reproducible, not bit-exact, on GPU.
+  - Loss is a cross-entropy value in nats (lower is better); it is not a
+    percentage and should never be reported as one.
+  - Dropout is active only during training; predictions at inference use the
+    full network.
+  - Scaling to [0,1] and adding the channel axis are both mandatory: without
+    them the network either trains poorly or rejects the input shape.
+  - Possible extensions if you want to go further: data augmentation (small
+    rotations/shifts), BatchNormalization, a third conv block, or replacing the
+    Flatten->Dense head with GlobalAveragePooling to cut parameters. None are
+    required to satisfy PS1.

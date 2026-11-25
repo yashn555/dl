@@ -1,0 +1,451 @@
+=====================================================================
+PS2 - TRANSFER LEARNING WITH MobileNetV2 (FEATURE EXTRACTION + FINE-TUNING)
+Complete notes: code explanations, model theory, viva questions
+=====================================================================
+
+---------------------------------------------------------------------
+1. PROBLEM STATEMENT (PS2)
+---------------------------------------------------------------------
+Use a pre-trained convolutional neural network (MobileNetV2, trained on
+ImageNet) for image classification, and improve it with fine-tuning.
+Instead of training a CNN from scratch, reuse the pre-trained feature
+extractor, attach a new classification head for the target dataset
+(5 flower classes), train the head first, then unfreeze the top layers
+of the base model and continue training with a very small learning rate.
+
+Dataset: "Flower Photos" (TensorFlow example dataset, ~3670 JPEG images,
+5 classes: daisy, dandelion, roses, sunflowers, tulips). It is downloaded
+and extracted automatically on first run into ~/.keras/datasets.
+Split: 80% training (2936 images) / 20% validation (734 images),
+generated with the SAME seed (42) so the two subsets are disjoint
+(no data leakage).
+
+---------------------------------------------------------------------
+2. HOW TO RUN
+---------------------------------------------------------------------
+Requirements: TensorFlow >= 2.13 (Keras 3 also works), numpy, matplotlib,
+seaborn, scikit-learn, and an NVIDIA GPU with >= 2 GB FREE VRAM
+(Colab T4 is ideal). nvidia-smi should be on PATH for the VRAM check
+(it normally is when the NVIDIA driver is installed).
+
+Run cells top-to-bottom. The FIRST code cell is a safety gate:
+ - If no GPU is visible to TensorFlow  -> prints a friendly, actionable
+   error message and stops execution (SystemExit).
+ - If a GPU exists but free VRAM < 2048 MB -> prints how much was found,
+   what is needed, how to fix it, and stops.
+ - Otherwise it enables memory growth (TensorFlow allocates VRAM
+   gradually instead of grabbing the whole GPU) and switches on
+   mixed_float16 precision on GPUs with compute capability >= 7.0
+   (T4 = 7.5, so it is enabled on Colab).
+If the gate stops the notebook, fix the environment (enable GPU runtime
+in Colab, or close other GPU applications locally), RESTART the kernel,
+and run again. Nothing after the gate executes on failure.
+
+Typical total runtime on a T4: ~3-5 minutes for both training stages.
+
+---------------------------------------------------------------------
+3. CELL-BY-CELL CODE EXPLANATION (the "comments", kept out of the notebook)
+---------------------------------------------------------------------
+
+CELL 1 - Setup + GPU/VRAM gate
+- IMG=(160,160): MobileNetV2 supports 96/128/160/192/224 inputs; 160 is a
+  good speed/accuracy trade-off. BATCH=32 fits comfortably in 2 GB VRAM
+  with mixed precision.
+- EPOCHS=5 / FINE_EPOCHS=5: 5 epochs per stage is enough for this small
+  dataset because the base already knows generic visual features.
+- FINE_TUNE_LAYERS=30: only the last 30 layers of the 154-layer base are
+  unfrozen in stage 2 (the most task-specific, high-level features).
+- MIN_FREE_VRAM_MB=2048: measured headroom needed for this model/batch.
+- keras.utils.set_random_seed(42): seeds Python, NumPy and TensorFlow for
+  reproducibility (splits, shuffling, augmentation, weight init).
+- require_gpu():
+    * tf.config.list_physical_devices("GPU") == [] -> friendly message
+      + raise SystemExit -> notebook halts immediately (no confusing
+      CUDA stack traces later).
+    * set_memory_growth(True): prevents TF from pre-allocating ~100% of
+      VRAM; wrapped in try/except so re-running the cell is safe.
+    * nvidia-smi --query-gpu=memory.free: actual FREE VRAM in MB; max()
+      picks the freest GPU on multi-GPU machines. If the query fails
+      (tool missing), we warn and continue rather than block falsely.
+    * free < minimum -> friendly message + SystemExit.
+- Mixed precision policy: get_device_details() reports compute
+  capability; >= 7.0 (Volta/Turing/Ampere, i.e. Tensor Cores) ->
+  "mixed_float16" (float16 math, float32 master weights). Otherwise
+  float32. Keras automatically wraps the optimizer with loss scaling.
+- Final prints: TF version, GPU name, free VRAM, active policy.
+
+CELL 2 - Dataset
+- keras.utils.get_file(...): downloads flower_photos.tgz once (cached in
+  ~/.keras/datasets) and extracts it.
+- next(Path(path).parent.rglob("daisy")).parent: robustly locates the
+  class-folder root regardless of where extraction placed it (works
+  across Keras versions that return either the archive path or the
+  extracted directory).
+- image_dataset_from_directory(...): reads folder names as labels
+  (alphabetical: daisy=0 ... tulips=4), resizes to 160x160, batches 32.
+  validation_split=0.2 + subset + identical seed=42 -> complementary,
+  non-overlapping train/val splits. label_mode="int" gives integer
+  labels, matching sparse_categorical_crossentropy.
+- class_names / num_classes are read BEFORE wrapping the datasets
+  (the .cache() wrapper would drop the .class_names attribute).
+- train_ds.cache().shuffle(1000).prefetch(AUTOTUNE):
+    cache  -> decode JPEGs once (epoch 1), later epochs read tensors
+              from RAM (big speed-up);
+    shuffle-> re-randomizes order every epoch AFTER the cache, so
+              caching does not freeze the order;
+    prefetch-> CPU prepares batch N+1 while GPU trains on batch N.
+  val_ds: cache + prefetch only (no shuffle -> stable order, which the
+  evaluation cell relies on).
+
+CELL 3 - Sample grid
+- take(1) pulls one batch; imshow of 8 images with class titles.
+  Sanity check that images/labels line up before training.
+
+CELL 4 - Model
+- MobileNetV2(include_top=False, weights="imagenet"): loads the
+  convolutional feature extractor WITHOUT its 1000-class ImageNet head,
+  with pre-trained weights (~2.26M parameters).
+- base.trainable=False: freeze everything for stage 1.
+- Functional pipeline:
+    Input(160,160,3)
+    -> RandomFlip("horizontal"), RandomRotation(0.1), RandomZoom(0.1)
+       Data augmentation. These layers are ACTIVE ONLY during fit()
+       (training=True) and become identity at validation/inference.
+       Putting them INSIDE the model means they run on the GPU and
+       still randomize every epoch even though the dataset is cached.
+    -> mobilenet_v2.preprocess_input: scales pixels [0,255] -> [-1,1],
+       exactly the normalization MobileNetV2 saw during ImageNet
+       training. Skipping this is the #1 cause of bad transfer results.
+    -> base(x, training=False): forces BatchNormalization layers into
+       INFERENCE mode (use stored moving mean/variance, do not update
+       them). Essential when freezing a pre-trained base.
+    -> GlobalAveragePooling2D: 5x5x1280 feature map -> 1280-d vector
+       (average each channel). Zero parameters, strong regularization.
+    -> Dropout(0.2): randomly zeroes 20% of the vector during training
+       to reduce overfitting of the small head.
+    -> Dense(5, softmax, dtype="float32"): 5 class probabilities.
+       dtype="float32" forces the softmax to run in full precision even
+       under mixed_float16 (numerical stability - required best practice).
+- compile: Adam(1e-3) is appropriate for a randomly initialized head;
+  sparse_categorical_crossentropy because labels are integers 0..4.
+- Parameter printout: total = 2,264,389; trainable in stage 1 = 6,405
+  (1280*5 weights + 5 biases). Only 0.28% of the network trains!
+
+CELL 5 - Stage 1 (feature extraction)
+- EarlyStopping(monitor="val_loss", patience=2, restore_best_weights=True):
+  stop if validation loss has not improved for 2 epochs, then roll the
+  weights back to the best epoch (protects against late overfitting).
+- fit(...): only the 6,405 head parameters update; the frozen base acts
+  as a fixed feature extractor. verbose=2 prints one line per epoch.
+
+CELL 6 - Stage 2 (fine-tuning)
+- base.trainable=True, then re-freeze all but the last 30 layers:
+  early layers detect universal patterns (edges, textures) and should
+  not change; late layers encode higher-level concepts worth adapting
+  to flowers.
+- Additionally freeze every BatchNormalization layer inside the
+  unfrozen block (BN gamma/beta kept fixed). With small batches,
+  updating BN statistics destabilizes pre-trained features; this is
+  the official Keras transfer-learning recommendation.
+- RE-COMPILE with Adam(1e-5): trainable flags only take effect after
+  compile; the 100x smaller learning rate makes tiny, careful updates
+  so we do not destroy the ImageNet features (catastrophic forgetting).
+- Print new trainable count (roughly 1.5M, BN excluded), then fit 5
+  more epochs with a fresh EarlyStopping callback.
+
+CELL 7 - Curves
+- evaluate() on val_ds gives final loss/accuracy (best weights restored).
+- h1.history + h2.history concatenated -> one continuous 10-epoch plot;
+  the dashed gray line at n1-0.5 marks where fine-tuning began, so you
+  can visually verify the second-stage improvement.
+
+CELL 8 - Classification report + confusion matrix
+- y_true: concatenate labels from val_ds (cached, unshuffled -> order
+  is deterministic and matches prediction order).
+- y_pred: one vectorized model.predict(val_ds) -> argmax over the 5
+  probabilities.
+- classification_report: per-class precision, recall, F1 and support.
+- seaborn heatmap of the 5x5 confusion matrix with class names:
+  rows = actual, columns = predicted; diagonal = correct predictions.
+
+CELL 9 - Qualitative check
+- One validation batch, predicted vs actual label per image; green
+  title = correct, red = wrong. Fast visual error analysis.
+
+CELL 10 - Save + inference utility
+- model.save("mobilenetv2_flowers.keras"): native Keras format; the
+  saved model INCLUDES preprocessing and the (now-inert) augmentation
+  layers, so deployment needs no extra preprocessing code.
+- predict_image(path): load any local image, resize to 160x160, add a
+  batch dimension, predict, display the image with the winning class
+  and confidence, and return {class: probability}. Useful for the lab
+  demo/viva. Reload later with keras.models.load_model(...).
+
+---------------------------------------------------------------------
+4. MODEL THEORY
+---------------------------------------------------------------------
+4.1 Why transfer learning?
+Training a deep CNN from scratch needs millions of images and hours of
+GPU time. A network pre-trained on ImageNet (1.2M images, 1000 classes)
+has already learned a hierarchy of reusable features:
+  early layers  -> edges, corners, color blobs, textures
+  middle layers -> motifs, petals, leaf shapes, parts
+  deep layers   -> object-level compositions
+For a new, small dataset (2936 training images), we reuse this
+hierarchy and only learn a new mapping from features -> our 5 classes.
+Result: high accuracy (~87-90%) in minutes instead of hours.
+
+4.2 MobileNetV2 architecture (the base model)
+Designed for mobile/edge devices: ~3.4M parameters (2.26M without the
+top), fast and memory-light, yet accurate. Key ideas:
+
+(a) Depthwise separable convolution
+    Standard conv cost: K*K*Cin*Cout parameters.
+    Depthwise separable = depthwise (K*K per input channel) +
+    pointwise 1x1 (Cin*Cout) to mix channels.
+    Cost: K*K*Cin + Cin*Cout  ->  ratio ~ 1/Cout + 1/K^2.
+    With K=3 and many output channels this is ~8-9x cheaper with
+    almost no accuracy loss.
+
+(b) Inverted residual block with linear bottleneck
+    narrow (low-dim) -> 1x1 EXPAND (x6 channels, ReLU6)
+                     -> 3x3 depthwise (ReLU6)
+                     -> 1x1 PROJECT back to narrow, NO activation
+                        (linear bottleneck).
+    The shortcut connects the NARROW ends (opposite of ResNet, hence
+    "inverted"). Keeping the bottleneck linear avoids ReLU destroying
+    information in low-dimensional tensors. ReLU6 (cap at 6) is
+    quantization/float16 friendly.
+
+(c) Stride-2 downsampling: 160x160 input -> /32 -> 5x5 spatial map with
+    1280 channels at the output of the truncated base.
+
+4.3 The custom head
+    GlobalAveragePooling2D: 5x5x1280 -> 1280. Compared with Flatten
+    (25*1280 = 32000 values -> a Dense layer would need 160k params),
+    GAP needs 0 params, is translation-robust and heavily regularizes.
+    Dropout(0.2): prevents the tiny head from memorizing the train set.
+    Dense(5, softmax): outputs a probability distribution over classes
+    (values in [0,1], sum = 1). Prediction = argmax.
+
+4.4 Loss: sparse categorical crossentropy
+    L = -log(p_true_class) for the integer-labeled sample.
+    "Sparse" = labels are integers (0..4), no one-hot needed;
+    mathematically identical to categorical crossentropy with one-hot
+    targets. Minimizing it = maximizing the probability of the correct
+    class (maximum likelihood).
+
+4.5 Two-stage training strategy
+    Stage 1 - FEATURE EXTRACTION: base frozen (and in inference mode),
+    Adam lr=1e-3. The head starts RANDOM; if the base were trainable
+    now, the huge initial error gradients would flow back and wreck
+    the pre-trained weights. So we first "align" the head on top of
+    fixed features.
+    Stage 2 - FINE-TUNING: unfreeze only the top 30 layers, keep all
+    BatchNorm layers frozen, Adam lr=1e-5. Now the head is sane, so
+    gradients are small; the tiny lr nudges high-level features toward
+    flower-specific patterns without erasing ImageNet knowledge.
+    Typical effect: validation accuracy jumps ~1-3 points and
+    validation loss drops further (visible after the dashed line).
+
+4.6 BatchNormalization subtleties
+    BN normalizes activations using batch statistics during training
+    and moving averages during inference. base(x, training=False)
+    forces inference mode even inside fit(); additionally setting
+    BN.trainable=False in stage 2 stops updates of its scale/offset.
+    Fine-tuning BN on small batches (32) with a new domain shifts the
+    statistics and usually HURTS accuracy - hence the double protection.
+
+4.7 Data augmentation
+    RandomFlip(horizontal), RandomRotation(+-10% of 2pi), RandomZoom(10%)
+    create label-preserving variations, effectively enlarging the
+    dataset and reducing overfitting. Inside the model they:
+      - run on GPU,
+      - are automatically disabled at validation/test time,
+      - re-randomize every epoch despite dataset caching.
+
+4.8 Mixed precision (mixed_float16)
+    Matrix multiplications/convolutions run in float16 on Tensor Cores
+    (compute capability >= 7.0): ~2x throughput, ~half the activation
+    memory. Master weights stay float32; Keras applies automatic LOSS
+    SCALING so tiny float16 gradients do not underflow to zero.
+    The final softmax layer is pinned to float32 because exp/sum in
+    float16 can be numerically unstable.
+
+4.9 tf.data pipeline
+    cache(): expensive JPEG decode + resize happens once; later epochs
+    stream tensors from RAM.
+    shuffle(1000): fresh random order each epoch (after cache).
+    prefetch(AUTOTUNE): overlaps input preparation with GPU compute so
+    the GPU never waits for data.
+
+4.10 Regularization / callbacks summary
+    frozen base, GAP, Dropout(0.2), augmentation, tiny fine-tune lr,
+    EarlyStopping(patience=2, restore_best_weights=True) which both
+    stops wasted epochs and rewinds to the best-validation weights.
+
+4.11 Metrics
+    Precision = TP/(TP+FP): of images predicted as class c, how many
+    really were c.
+    Recall = TP/(TP+FN): of real class-c images, how many were found.
+    F1 = harmonic mean of the two.
+    Macro average = unweighted mean over classes (treats rare classes
+    equally); weighted average weights by support.
+    Confusion matrix: rows actual, columns predicted; the diagonal is
+    correct counts; off-diagonal hot spots reveal WHICH classes get
+    confused (here typically roses <-> tulips, similar color/shape).
+
+---------------------------------------------------------------------
+5. EXPECTED RESULTS (approximate, T4 GPU)
+---------------------------------------------------------------------
+Stage 1: val_accuracy rises ~0.80 -> ~0.86 within 5 epochs.
+Stage 2: val_accuracy ~0.87-0.90, val_loss ~0.30-0.36.
+Training accuracy is slightly BELOW validation accuracy in stage 1 -
+this is normal: dropout + augmentation are active only during training.
+Per-class F1 ~0.82-0.95; dandelion/sunflowers easiest, roses/tulips
+hardest. Confusion matrix shows most mass on the diagonal with small
+roses<->tulips leakage. Exact numbers vary slightly run-to-run despite
+seeding (GPU nondeterminism).
+
+---------------------------------------------------------------------
+6. VIVA QUESTIONS AND ANSWERS
+---------------------------------------------------------------------
+Q1. What is transfer learning and why use it here?
+A: Reusing a model trained on a large source task (ImageNet) as the
+   starting point for a related target task (flowers). With only ~2936
+   training images, training from scratch would overfit; pre-trained
+   features give high accuracy with minutes of training.
+
+Q2. Why MobileNetV2 and not VGG/ResNet?
+A: It is lightweight (~2.26M base params vs VGG16's ~14.7M), uses
+   depthwise separable convolutions and inverted residuals, trains and
+   infers fast, fits in small VRAM, and its ImageNet features transfer
+   well. Ideal for lab GPUs and edge deployment.
+
+Q3. Difference between feature extraction and fine-tuning?
+A: Feature extraction: base completely frozen, only the new head
+   trains. Fine-tuning: some top base layers are unfrozen and trained
+   together with the head at a very small learning rate so high-level
+   features adapt to the new domain.
+
+Q4. Why train the head first with the base frozen?
+A: The head is randomly initialized, producing large error gradients.
+   If the base were trainable immediately, those gradients would
+   destroy the pre-trained weights. Stage 1 makes the head sensible
+   first; stage 2 then adapts the base safely.
+
+Q5. Why does the learning rate drop from 1e-3 to 1e-5?
+A: Pre-trained weights are already near a good solution; large updates
+   would overwrite them (catastrophic forgetting). 1e-5 makes tiny,
+   surgical adjustments. 1e-3 is fine for the random head.
+
+Q6. Why keep BatchNormalization layers frozen during fine-tuning?
+A: Small batches (32) from a new domain give noisy batch statistics;
+   updating BN moving averages/scale-offset shifts the feature
+   distribution the rest of the network expects and degrades accuracy.
+   Frozen BN keeps the stable ImageNet statistics.
+
+Q7. What does base(x, training=False) do?
+A: It runs the base in inference mode even during fit(): BN uses its
+   stored moving mean/variance and does not update them; dropout (if
+   any) is disabled. trainable=False alone does NOT do this - both are
+   needed.
+
+Q8. Why is preprocess_input necessary?
+A: MobileNetV2 was trained on pixels scaled to [-1,1]. Feeding raw
+   [0,255] values puts inputs outside the distribution the weights
+   expect and sharply reduces accuracy. preprocess_input applies the
+   exact same scaling.
+
+Q9. Why GlobalAveragePooling2D instead of Flatten?
+A: Flatten(5x5x1280)=32000 features -> Dense would need 160k params and
+   overfit. GAP averages each channel to one number (1280 features),
+   has zero parameters, is spatially robust, and acts as a regularizer.
+   The head ends up with only 6,405 trainable params in stage 1.
+
+Q10. What is the role of Dropout(0.2)?
+A: During training it randomly zeroes 20% of the pooled features,
+   preventing co-adaptation/memorization in the head. At inference it
+   is disabled automatically.
+
+Q11. Why softmax + sparse_categorical_crossentropy?
+A: Softmax converts 5 logits into a probability distribution; sparse
+   CE = -log(probability of the true class) and accepts INTEGER labels
+   (0..4), so no one-hot encoding is needed. With one-hot labels we
+   would use categorical_crossentropy instead - same math.
+
+Q12. What augmentation is used and why is it inside the model?
+A: Random horizontal flip, rotation (0.1), zoom (0.1). Inside the
+   model they run on the GPU, are active only during training, and
+   still randomize every epoch even though the dataset is cached
+   (augmentation happens after the cache).
+
+Q13. What is mixed precision? Why is the output layer float32?
+A: float16 compute + float32 master weights, with automatic loss
+   scaling; ~2x faster on Tensor-Core GPUs and lower VRAM. Softmax in
+   float16 can overflow/underflow, so the final Dense is pinned to
+   dtype="float32" for numerical stability.
+
+Q14. What does EarlyStopping(restore_best_weights=True) do?
+A: Watches val_loss; if it fails to improve for `patience` epochs,
+   training stops and the weights from the best epoch are restored -
+   automatic protection against overfitting in later epochs.
+
+Q15. What do cache(), shuffle(), prefetch(AUTOTUNE) do?
+A: cache stores decoded/resized tensors after epoch 1 (I/O done once);
+   shuffle re-randomizes order each epoch after the cache; prefetch
+   prepares the next batch while the GPU trains, hiding input latency.
+   AUTOTUNE lets tf.data pick buffer sizes dynamically.
+
+Q16. Explain depthwise separable convolution with a cost example.
+A: Split a standard conv into (1) depthwise: one KxK filter per input
+   channel, and (2) pointwise 1x1 conv to combine channels.
+   Example: 3x3, Cin=64, Cout=128: standard = 3*3*64*128 = 73,728
+   params; separable = 3*3*64 + 64*128 = 576 + 8192 = 8,768 (~8.4x
+   cheaper) with nearly the same accuracy.
+
+Q17. What is an inverted residual with linear bottleneck?
+A: Expand a narrow tensor x6 with a 1x1 conv (ReLU6), apply 3x3
+   depthwise conv, project back to narrow with a 1x1 conv WITHOUT
+   activation, and add a shortcut between the narrow ends. "Inverted"
+   because shortcuts connect thin (not wide) layers; "linear" because
+   the bottleneck has no ReLU, preserving information in low dimensions.
+
+Q18. How do you read the confusion matrix and report? Which classes
+    confuse the model?
+A: Rows = actual class, columns = predicted; diagonal = correct.
+   Off-diagonal cells show specific confusions - here mostly
+   roses<->tulips (similar colors/petal shapes). The report gives
+   per-class precision (purity of predictions), recall (coverage of
+   the class) and F1; macro avg treats all classes equally.
+
+Q19. Why does the notebook stop when there is no GPU? How much VRAM
+    is needed?
+A: This workload is GPU-intensive; the first cell checks for a CUDA
+   GPU and >= 2048 MB FREE VRAM (via nvidia-smi) and exits with clear
+   instructions instead of failing later with cryptic CUDA/OOM errors.
+   Memory growth is enabled so TensorFlow does not reserve the whole
+   GPU. Fix: enable the Colab GPU runtime or free local GPU memory,
+   restart the kernel, run again.
+
+Q20. How would you push accuracy higher, and how is the model reused?
+A: Unfreeze more layers, use 224x224 inputs, train longer with a
+   learning-rate schedule, stronger augmentation, a larger backbone
+   (EfficientNet), or more data. Reuse: the saved
+   mobilenetv2_flowers.keras contains preprocessing + head, so
+   keras.models.load_model(...) then model.predict on a resized
+   (160,160,3) batch is all that is needed - exactly what the
+   predict_image() utility demonstrates.
+
+---------------------------------------------------------------------
+7. QUICK TROUBLESHOOTING
+---------------------------------------------------------------------
+- "GPU NOT FOUND": Colab -> Runtime > Change runtime type > T4 GPU;
+  locally install NVIDIA driver + CUDA-compatible TensorFlow.
+- "NOT ENOUGH FREE VRAM": close other GPU apps/notebooks, restart
+  kernel; or lower BATCH to 16.
+- nvidia-smi missing: gate warns and continues if a GPU exists.
+- Slow first epoch: JPEG decoding before cache fills - normal.
+- Download blocked: pre-download flower_photos.tgz into
+  ~/.keras/datasets and rerun.
+=====================================================================

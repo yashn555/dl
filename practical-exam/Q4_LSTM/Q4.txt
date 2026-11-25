@@ -1,0 +1,331 @@
+======================================================================
+PS4 : LSTM FOR CHARACTER-LEVEL TEXT GENERATION (SHAKESPEARE)
+Notebook: ps04_lstm_text_generation.ipynb
+======================================================================
+
+----------------------------------------------------------------------
+1. PROBLEM STATEMENT (PS)
+----------------------------------------------------------------------
+Implement a Long Short-Term Memory (LSTM) network that generates text at
+the character level. The model is trained on a corpus of Shakespeare so
+that, given a short seed string, it produces new text one character at a
+time in a similar style. This is a language-modelling task: learn
+P(next character | previous characters) and sample from it repeatedly.
+
+----------------------------------------------------------------------
+2. WHAT THE FINALIZED NOTEBOOK DOES
+----------------------------------------------------------------------
+Cell 1 : GPU / VRAM guard. Asks TensorFlow which GPUs are visible. If none
+         exist, it prints a friendly boxed message (with Colab/local fix
+         instructions) and raises SystemExit so "Run all" stops
+         immediately. If a GPU exists, memory growth is enabled so VRAM
+         is allocated on demand instead of reserving the whole card.
+Cell 2 : Imports and hyperparameters: EPOCHS=15, SEQ_LEN=40,
+         MAX_CHARS=200000; random seed fixed for reproducibility.
+Cell 3 : Downloads the Shakespeare corpus automatically, lowercases it,
+         keeps the first 200,000 characters, builds the vocabulary
+         (37 unique symbols) and the char<->id lookup tables.
+Cell 4 : Creates training pairs with a sliding window: every 3rd position
+         gives a 40-character input and the following character as the
+         label -> X shape (66654, 40), y shape (66654,).
+Cell 5 : Model = Embedding(37 -> 64) -> LSTM(256) -> Dense(37, softmax).
+         Compiled with Adam + sparse categorical crossentropy.
+         Total trainable parameters: 340,581 (~1.3 MB).
+Cell 6 : Trains for 15 epochs, batch size 128, 10% validation split.
+Cell 7 : Plots train/validation loss and accuracy curves; prints final
+         validation accuracy (~0.47) and perplexity exp(val_loss) (~6.8).
+Cell 8 : Autoregressive generation with temperature sampling at
+         T = 0.2, 0.5, 1.0 from the seed "second citizen:\n".
+
+Expected on a T4 GPU: roughly 30-35 s per epoch, ~8-9 minutes total.
+The notebook contains no code comments; all explanation lives here.
+
+----------------------------------------------------------------------
+3. COMMENTED CODE (MIRROR OF EACH CELL)
+----------------------------------------------------------------------
+
+--- Cell 1: GPU guard -------------------------------------------------
+import tensorflow as tf
+
+gpus = tf.config.list_physical_devices("GPU")   # list visible GPUs
+if not gpus:                                    # no GPU -> stop early
+    print("=" * 62)                             # friendly boxed error
+    print("GPU NOT FOUND - this notebook needs a GPU to train the LSTM.")
+    print("How to fix:")
+    print("  Colab : Runtime > Change runtime type > T4 GPU, then Run all.")
+    print("  Local : install a CUDA-enabled TensorFlow build and retry.")
+    print("=" * 62)
+    raise SystemExit("Stopped: no GPU available.")  # halts Run-all
+
+for gpu in gpus:
+    tf.config.experimental.set_memory_growth(gpu, True)
+    # grow VRAM usage gradually; avoids grabbing all memory at startup
+print("Using GPU:", gpus[0].name)
+
+--- Cell 2: imports + configuration -----------------------------------
+import matplotlib.pyplot as plt        # training curves
+import numpy as np                     # arrays + sampling
+from tensorflow import keras           # high-level API
+from tensorflow.keras import layers    # layer building blocks
+
+EPOCHS = 15            # passes over the training set
+SEQ_LEN = 40           # context window: 40 characters predict the 41st
+MAX_CHARS = 200000     # use only the first 200k characters (keeps it fast)
+keras.utils.set_random_seed(42)   # reproducible init / shuffling
+
+--- Cell 3: corpus + vocabulary ---------------------------------------
+path = keras.utils.get_file(           # downloads once, then cached
+    "shakespeare.txt",
+    "https://storage.googleapis.com/download.tensorflow.org/data/shakespeare.txt",
+)
+text = open(path, encoding="utf-8").read().lower()[:MAX_CHARS]
+# lowercase halves the vocabulary (A and a become one symbol)
+chars = sorted(set(text))              # 37 unique characters
+char_to_id = {c: i for i, c in enumerate(chars)}  # encode table
+id_to_char = np.array(chars)                      # decode table
+print("Characters:", len(text), "Vocabulary:", len(chars))
+print(text[:300])                      # sanity check of the raw corpus
+
+--- Cell 4: sliding-window dataset ------------------------------------
+encoded = np.array([char_to_id[c] for c in text])  # text -> integer ids
+starts = range(0, len(encoded) - SEQ_LEN, 3)       # stride 3: overlap but
+                                                   # not fully redundant
+X = np.array([encoded[i:i + SEQ_LEN] for i in starts])  # inputs (N, 40)
+y = np.array([encoded[i + SEQ_LEN] for i in starts])    # next char (N,)
+print("X:", X.shape, "y:", y.shape)    # (66654, 40) (66654,)
+
+--- Cell 5: model ------------------------------------------------------
+model = keras.Sequential([
+    layers.Input((None,)),             # variable-length integer sequence
+    layers.Embedding(len(chars), 64),  # each char id -> learned 64-d vector
+    layers.LSTM(256),                  # reads 40 steps, returns final h_t
+    layers.Dense(len(chars), activation="softmax"),  # 37-way probability
+])
+model.compile(optimizer="adam",
+              loss="sparse_categorical_crossentropy",  # integer labels
+              metrics=["accuracy"])                    # top-1 next-char
+model.summary()                        # 340,581 trainable parameters
+
+--- Cell 6: training ---------------------------------------------------
+history = model.fit(X, y, epochs=EPOCHS, batch_size=128,
+                    validation_split=0.1,  # last 10% held out for val
+                    verbose=2)             # one line per epoch
+
+--- Cell 7: evaluation -------------------------------------------------
+fig, ax = plt.subplots(1, 2, figsize=(10, 4))
+for i, metric in enumerate(["loss", "accuracy"]):
+    ax[i].plot(history.history[metric], label="train")
+    ax[i].plot(history.history["val_" + metric], label="validation")
+    ax[i].set_title(metric); ax[i].set_xlabel("epoch"); ax[i].legend()
+plt.show()
+print(f"Final validation accuracy: {history.history['val_accuracy'][-1]:.4f}")
+print(f"Validation perplexity: {np.exp(history.history['val_loss'][-1]):.2f}")
+# perplexity = exp(cross-entropy): "effective number of choices" per step
+
+--- Cell 8: temperature sampling / generation --------------------------
+def generate(seed, n_chars=400, temperature=1.0):
+    sentence = seed.lower()
+    for _ in range(n_chars):                       # one char per iteration
+        context = sentence[-SEQ_LEN:]              # last 40 chars = context
+        x = np.array([[char_to_id[c] for c in context]])   # shape (1, len)
+        probs = model.predict(x, verbose=0)[0]     # softmax over 37 chars
+        logits = np.log(probs + 1e-8) / temperature  # re-scale sharpness
+        probs = np.exp(logits) / np.exp(logits).sum()  # renormalise
+        sentence += id_to_char[np.random.choice(len(chars), p=probs)]
+        # sample (not argmax) so output is varied; append and continue
+    return sentence
+
+seed = "second citizen:\n"             # all seed chars exist in the vocab
+for t in [0.2, 0.5, 1.0]:              # conservative -> balanced -> wild
+    print(f"--- temperature {t} ---")
+    print(generate(seed, temperature=t))
+    print()
+
+----------------------------------------------------------------------
+4. MODEL THEORY
+----------------------------------------------------------------------
+4.1 Task formulation
+    A character-level language model estimates P(x_t | x_{t-40..t-1}).
+    Training = 37-class classification at every window; generation =
+    repeatedly sampling from that distribution and feeding it back
+    (autoregression).
+
+4.2 Why a recurrent network?
+    Text is sequential: meaning depends on order and on earlier symbols.
+    An RNN keeps a hidden state h_t that summarises everything read so
+    far, applying the SAME weights at every time step (weight sharing
+    across time). Training uses Backpropagation Through Time (BPTT):
+    the network is unrolled over 40 steps and gradients flow backwards
+    through all of them.
+
+4.3 The vanishing-gradient problem
+    In a plain (Simple)RNN the gradient picks up a factor of the same
+    recurrent matrix at every step. Over 40 steps this product shrinks
+    (or explodes) exponentially, so the network cannot learn long-range
+    dependencies (e.g. closing a quote opened 30 characters earlier).
+
+4.4 LSTM cell (Hochreiter & Schmidhuber, 1997)
+    LSTM adds a second memory line, the cell state c_t, updated
+    ADDITIVELY, plus three sigmoid gates (values in [0,1]):
+
+        f_t = sigmoid(W_f x_t + U_f h_{t-1} + b_f)   forget gate
+        i_t = sigmoid(W_i x_t + U_i h_{t-1} + b_i)   input gate
+        g_t = tanh   (W_g x_t + U_g h_{t-1} + b_g)   candidate content
+        o_t = sigmoid(W_o x_t + U_o h_{t-1} + b_o)   output gate
+        c_t = f_t * c_{t-1} + i_t * g_t              cell update
+        h_t = o_t * tanh(c_t)                        hidden output
+
+    - forget gate: how much old memory to keep
+    - input gate : how much new content to write
+    - output gate: how much memory to expose as h_t
+    Because c_t = f_t*c_{t-1} + ... is an additive path, gradients can
+    flow across many steps without vanishing ("constant error carousel").
+    This is why LSTM learns spelling, line breaks and speaker names far
+    better than a SimpleRNN of the same size.
+
+4.5 Embedding layer
+    Instead of one-hot vectors (37-d, mostly zeros), each character id
+    indexes a trainable 37x64 matrix. Similar characters end up with
+    similar vectors, and the LSTM receives dense, informative inputs.
+
+4.6 Readout and loss
+    layers.LSTM(256) with return_sequences=False keeps only h_40, a
+    256-d summary of the whole window (many-to-one architecture).
+    Dense(37, softmax) converts it to probabilities over the vocabulary.
+    Loss = sparse categorical crossentropy = -log p(correct next char).
+    "Sparse" means labels are integer ids, so no one-hot targets needed.
+    Accuracy = fraction of windows where the top-1 guess is correct.
+
+4.7 Perplexity
+    PP = exp(mean cross-entropy). With val loss ~1.92, PP ~ 6.8: the
+    model is, on average, as uncertain as if it were choosing uniformly
+    among ~7 characters (out of 37). Lower is better; PP = 1 is perfect.
+
+4.8 Temperature sampling
+    Rescale probabilities as p_i' proportional to p_i^(1/T):
+      T = 0.2 -> distribution sharpened: safe, repetitive, near-greedy
+      T = 0.5 -> mild diversity, mostly well-formed words
+      T = 1.0 -> raw model distribution: creative but more misspellings
+      T -> 0  -> argmax (deterministic, loops); T >> 1 -> near-uniform noise
+    Sampling (instead of always taking argmax) prevents degenerate loops.
+
+4.9 Training vs generation (exposure bias)
+    During training the context is always ground-truth text (teacher
+    forcing). During generation the model consumes its OWN previous
+    outputs, so its mistakes accumulate - this mismatch is called
+    exposure bias, and is why generated text drifts after a while.
+
+4.10 Capacity and overfitting
+    Train accuracy reaches ~0.70 while validation plateaus near ~0.47:
+    the model starts memorising the 200k-character corpus. Remedies:
+    more data, dropout / recurrent_dropout, early stopping on val_loss,
+    or a smaller hidden size.
+
+4.11 Parameter count (verify by hand)
+    Embedding : 37 * 64                              =   2,368
+    LSTM      : 4 * (256*(64+256) + 256)             = 328,704
+                (4 gate blocks, each W, U, b)
+    Dense     : 256*37 + 37                          =   9,509
+    Total                                            = 340,581
+
+----------------------------------------------------------------------
+5. VIVA QUESTIONS AND ANSWERS
+----------------------------------------------------------------------
+Q1. What problem does this experiment solve?
+    Character-level language modelling: predict the next character from
+    the previous 40, then sample repeatedly to generate Shakespeare-like
+    text.
+
+Q2. Why LSTM instead of a plain RNN?
+    Plain RNNs suffer vanishing gradients over long sequences. LSTM's
+    gated, additive cell state preserves information (and gradients)
+    across many time steps, so it learns longer-range structure.
+
+Q3. Name the LSTM gates and their roles.
+    Forget (erase old memory), input (write new content), output (expose
+    memory as hidden state). The candidate g_t proposes what to write.
+
+Q4. Difference between cell state c_t and hidden state h_t?
+    c_t is the internal long-term memory highway; h_t = o_t*tanh(c_t) is
+    the gated, externally visible summary passed to the next step/layer.
+
+Q5. What is BPTT?
+    Backpropagation Through Time: unroll the RNN over the sequence and
+    backpropagate the loss through every step, sharing weights.
+
+Q6. Why character-level rather than word-level?
+    Tiny vocabulary (37 vs thousands), no out-of-vocabulary problem,
+    learns spelling and punctuation. Cost: much longer sequences and
+    weaker semantic coherence than word/subword models.
+
+Q7. What does the Embedding layer do?
+    Trainable lookup table mapping each of 37 ids to a dense 64-d vector;
+    more efficient and expressive than one-hot input.
+
+Q8. Why is the Input shape (None,)?
+    Variable-length sequences: training uses length 40, generation can
+    start from a shorter seed and later use exactly 40 characters.
+
+Q9. Why sparse_categorical_crossentropy?
+    Labels are integer class ids (not one-hot). It computes
+    -log p(target class) directly; identical value to categorical CE.
+
+Q10. What is perplexity and what value did we get?
+    exp(cross-entropy loss); average "branching factor" of the model.
+    Val loss ~1.92 gives perplexity ~6.8 (like choosing among ~7 chars).
+
+Q11. What does temperature control in generation?
+    Sharpness of the sampling distribution: low T = conservative and
+    repetitive, high T = diverse but error-prone; T->0 becomes argmax.
+
+Q12. How exactly is text generated?
+    Autoregressive loop: encode last 40 chars, get softmax probabilities,
+    temperature-scale, sample one char, append, repeat 400 times.
+
+Q13. What is teacher forcing / exposure bias?
+    Training always feeds true context; generation feeds the model's own
+    predictions, so errors compound - the train/inference mismatch.
+
+Q14. Train accuracy ~0.70 but validation ~0.47 - interpretation?
+    Overfitting: memorisation of the small corpus. Fixes: more data,
+    dropout, early stopping, smaller model, regularisation.
+
+Q15. Derive the LSTM parameter count.
+    4 gates x (units*(input+units) + units) = 4*(256*320+256) = 328,704;
+    plus embedding 2,368 and dense 9,509 -> 340,581 total.
+
+Q16. Why window length 40 and stride 3?
+    40 chars is enough context for words/short phrases; stride 3 gives
+    ~66k overlapping training pairs without the redundancy of stride 1.
+
+Q17. Why lowercase the corpus?
+    Merges upper/lower case into one symbol, shrinking the vocabulary
+    and easing learning (at the cost of losing capitalisation).
+
+Q18. LSTM vs GRU?
+    GRU merges cell/hidden state and uses 2 gates (update, reset):
+    ~25% fewer parameters, often comparable quality; LSTM has a separate
+    memory line and finer control.
+
+Q19. Why does the notebook check for a GPU and set memory growth?
+    Unrolling 40 LSTM steps for 66k samples x 15 epochs is very slow on
+    CPU; the guard stops early with a clear message instead of a silent
+    multi-hour run. Memory growth allocates VRAM on demand, avoiding
+    out-of-memory conflicts with other processes.
+
+Q20. How could generation quality be improved?
+    Stack LSTM layers (return_sequences=True), add dropout, train on the
+    full corpus / more epochs with early stopping, or move to a
+    Transformer decoder for much longer context.
+
+----------------------------------------------------------------------
+6. QUICK TROUBLESHOOTING
+----------------------------------------------------------------------
+- "GPU NOT FOUND" box appears  -> enable GPU runtime (Colab: Runtime >
+  Change runtime type > T4 GPU) and Run all again. This is intentional.
+- KeyError during generation   -> seed contains a character outside the
+  37-symbol vocabulary; use lowercase letters/punctuation from corpus.
+- Slow epochs (>2 min)         -> you are on CPU; reconnect to a GPU.
+- Repetitive generated text    -> raise temperature (0.5-0.8) or train
+  longer; near-argmax sampling loops.
+======================================================================

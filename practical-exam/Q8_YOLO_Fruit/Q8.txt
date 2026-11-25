@@ -1,0 +1,373 @@
+======================================================================
+PS8 : FRUIT OBJECT DETECTION USING YOLOv8
+Notebook: ps08_yolo_fruit_detection.ipynb
+======================================================================
+
+----------------------------------------------------------------------
+1. PROBLEM STATEMENT (PS) AND THE DATASET REALITY
+----------------------------------------------------------------------
+PS8: "Object Detection using YOLO - Fruit image detection"
+Dataset: https://www.kaggle.com/datasets/afsananadia/fruits-images-dataset-object-detection
+
+THE HIDDEN BUG IN THIS DATASET:
+The dataset contains 400 images (320 train, 80 test) across 10 fruits
+(apple, banana, grapes, guava, hog plum, jackfruit, litchi, mango,
+orange, papaya) with YOLO-format bounding box text files.
+HOWEVER, every single .txt label file uses the class ID `0`. If you
+train on them as-is, you build a 1-class "generic fruit" detector, not
+a 10-class specific fruit detector. The true class is actually encoded
+in the image filename (e.g. `01_Banana.jpg`, `05_Hog Plum.jpg`).
+
+This notebook solves that silently and correctly:
+  1. Scans all filenames to discover the true 10 classes.
+  2. Extracts the class name from each filename using regex.
+  3. Rewrites every .txt label file, replacing the bogus `0` with the
+     correct class ID (0 to 9).
+  4. Trains a genuine 10-class YOLOv8 detector.
+
+----------------------------------------------------------------------
+2. DATASET FACTS
+----------------------------------------------------------------------
+Total: 400 images, ~75 MB, 10 classes.
+  Train File/: 320 images + 320 .txt files
+  Test File/ :  80 images +  80 .txt files
+Class balance: exactly 40 images per class in train, 8 per class in test.
+Image format: mostly JPG, some with spaces in names ("Hog Plum").
+Bounding boxes: already normalised (cx cy w h) in the [0,1] range, so
+the geometry is preserved exactly; only the class ID column is rewritten.
+
+----------------------------------------------------------------------
+3. HOW TO RUN
+----------------------------------------------------------------------
+Requirements: Colab T4 GPU (or any CUDA GPU with >= 6 GB total and
+>= 4 GB FREE VRAM), ultralytics + kagglehub (installed by the notebook),
+a Kaggle API token.
+
+ 1. Runtime > Change runtime type > T4 GPU.
+ 2. Add your Kaggle token as a Colab Secret named KAGGLE_API_TOKEN.
+ 3. Runtime > Run all.
+
+GPU/VRAM GATE (first cell):
+  If no CUDA GPU is visible, or total VRAM < 6 GB, or free VRAM < 4 GB,
+  the cell raises a RuntimeError with a boxed, actionable message and
+  Run-all stops immediately - no silent multi-hour CPU run, no mid-
+  training OOM crash.
+
+Approximate runtime on T4:
+  gate + install + download       ~1-2 min
+  label rewriting (400 files)     ~2 seconds
+  training (30 epochs @640)       ~12-18 min (patience=15 may stop
+                                  earlier if fitness stalls)
+  evaluation + plots              ~1 min
+  Total                           ~15-22 min -> fits in one Colab session.
+
+Disconnect insurance: Ultralytics writes runs/fruit_det/weights/last.pt
+every epoch. To resume after a disconnect:
+    YOLO('runs/fruit_det/weights/last.pt').train(resume=True)
+
+----------------------------------------------------------------------
+4. CELL-BY-CELL CODE COMMENTS (the notebook itself has no comments)
+----------------------------------------------------------------------
+
+--- Cell 1: GPU / VRAM gate -------------------------------------------
+import torch
+MIN_TOTAL_VRAM_GB = 6.0
+MIN_FREE_VRAM_GB  = 4.0
+_gpu_fail() prints a boxed Problem/Fix message inside a RuntimeError
+-> halts Run-all cleanly.
+torch.cuda.is_available()    : no GPU -> fail with instructions.
+get_device_properties(0)     : physical VRAM of GPU 0.
+torch.cuda.mem_get_info(0)[0]: FREE VRAM right now - catches other
+                               notebooks/processes hogging memory.
+total check has +0.5 GB tolerance for cards reporting e.g. 5.8 of 6 GB.
+
+--- Cell 2: install + imports + configuration -------------------------
+%pip install -q ultralytics kagglehub
+re/shutil/Path               : regex parsing, file copying, paths
+matplotlib                   : plotting results
+YOLO                         : Ultralytics model API
+
+SEED=42       : reproducible training
+EPOCHS=30     : upper bound; patience=15 early-stops on fitness stall
+IMG=640       : standard YOLO detection resolution
+WORKERS=2     : matches Colab's 2 vCPUs; more workers SLOW things down
+ALIASES       : maps dataset typos ('hogpulm' -> 'hogplum',
+                'lichi' -> 'litchi') so class counts stay at 10
+
+--- Cell 3: dataset download + label rewriting ------------------------
+kagglehub.dataset_download(...)    # cached download (~75 MB)
+# on failure: boxed message with two fixes, then SystemExit
+SRC = Path(DATA_DIR); OUT = Path('fruits_yolo')
+mkdir images/{train,val} and labels/{train,val}
+
+clean_name(stem):
+    regex removes the leading digits and underscore ('01_Banana' -> 'banana')
+    lowercases and strips spaces ('05_Hog Plum' -> 'hogplum')
+    applies ALIASES to fix typos
+    -> returns a clean 10-class vocabulary
+
+all_classes:
+    first pass over ALL .jpg files to discover the exact 10-class set
+    (guarantees stable class IDs across train and val)
+classes = sorted(all_classes)
+
+split_map = {'train': 'Train File', 'val': 'Test File'}
+    rglob('*.jpg') handles the nested 'Train File/Train File/' layout
+    for each image:
+        - find its matching .txt file
+        - extract the true class from the filename -> cls_id
+        - copy the image to fruits_yolo/images/{split}/
+        - read the .txt, KEEP the cx cy w h coordinates, REPLACE the
+          leading class ID with cls_id, write to labels/{split}/
+counts printed as a sanity check (expect 320 train, 80 val)
+
+yaml_content:
+    hand-written data.yaml (no yaml dependency):
+        path: <absolute fruits_yolo path>
+        train: images/train
+        val: images/val
+        names: {0: apple, 1: banana, ... 9: papaya}
+
+--- Cell 5: training --------------------------------------------------
+YOLO('yolov8n.pt')                 # COCO-pretrained nano detector
+                                   # (~3.2M params, ~8.7 GFLOPs @640)
+.train(data=data.yaml, epochs=30, imgsz=640,
+       batch=-1,                   # AutoBatch: picks the largest batch
+                                   # fitting ~60% of free CUDA memory
+       workers=2, seed=42,
+       patience=15,                # early stop on fitness (mAP blend)
+       project='runs', name='fruit_det', exist_ok=True)
+Ultralytics automatically: transfers COCO weights (head re-initialised
+for 10 classes), enables AMP, applies mosaic/HSV/flip/scale augmentation
+(mosaic disabled for the last 10 epochs), saves best.pt/last.pt every
+epoch, and writes results.csv + plots.
+
+--- Cell 7: metrics + training plots ----------------------------------
+.val() recomputes on the val split with the best weights:
+    metrics.box.mp      # mean precision
+    metrics.box.mr      # mean recall
+    metrics.box.map50   # mAP at IoU 0.50
+    metrics.box.map     # mAP averaged over IoU 0.50:0.05:0.95 (COCO)
+Displays Ultralytics' results.png (loss/metric curves) and
+confusion_matrix.png (includes a 'background' row/column for missed or
+spurious detections).
+
+--- Cell 8: predicted boxes on validation images ----------------------
+predict() on 8 val images; r.plot() returns the annotated BGR image
+(box + class + confidence); [..., ::-1] converts to RGB for matplotlib.
+
+--- Cell 10: save + single-image inference ----------------------------
+Copies runs/fruit_det/weights/best.pt -> outputs/fruits_yolov8n_det.pt
+detect_image(path, conf):
+    one-image predict, show annotated result, and return a list of
+    (class_name, confidence, xyxy_box) tuples - handy for the lab
+    demo/viva. Reload later with: YOLO('outputs/fruits_yolov8n_det.pt')
+
+----------------------------------------------------------------------
+5. MODEL THEORY
+----------------------------------------------------------------------
+5.1 YOLO = You Only Look Once (one-stage detector)
+    Two-stage detectors (Faster R-CNN) first propose regions, then
+    classify them - accurate but slow. YOLO predicts boxes and class
+    scores in a SINGLE forward pass over a grid of the image, giving
+    real-time speed. YOLOv8 is anchor-free: each grid cell directly
+    regresses distances to the box edges instead of adjusting predefined
+    anchor shapes.
+
+5.2 YOLOv8 architecture
+    Backbone: CSPDarknet-style with C2f blocks (cross-stage partial
+      connections + bottleneck splits) -> multi-scale feature maps
+      P3/P4/P5 (strides 8/16/32) + SPPF (spatial pyramid pooling-fast)
+      for context.
+    Neck: PAN-FPN - top-down + bottom-up fusion so small-object layers
+      see semantics and large-object layers see detail.
+    Head: decoupled, anchor-free - separate conv branches for
+      classification and box regression at each scale.
+    'n' (nano) is the smallest depth/width scaling (~3.2M parameters);
+    right-sized for 320 training images and a T4 GPU.
+
+5.3 Losses and label assignment
+    Box: CIoU loss (overlap + centre distance + aspect ratio) plus
+      DFL (Distribution Focal Loss) which regresses edge distances as
+      discretised distributions for finer localisation.
+    Class: binary cross-entropy per class (10 independent sigmoid
+      outputs per anchor, not a 10-way softmax).
+    Task-Aligned Assigner (TAL): dynamically picks which grid cells are
+      positive samples using a score combining classification quality
+      and IoU.
+
+5.4 Inference post-processing
+    Thousands of raw predictions -> confidence threshold (CONF=0.25)
+    -> class-wise Non-Maximum Suppression (NMS): keep the highest-score
+    box, drop overlapping boxes of the same class with IoU above a
+    threshold. Output: a handful of clean detections per image.
+
+5.5 Transfer learning
+    yolov8n.pt is pretrained on COCO (80 classes, 120k images). Its
+    backbone/neck already encode edges, textures, round shapes,
+    colours; only the 10-class head is new. With only 320 training
+    images, this is the difference between a usable detector and a
+    memorising one.
+
+5.6 Augmentation used by Ultralytics
+    Mosaic (4 images stitched), random scale/translate, horizontal flip,
+    HSV jitter (colour is a primary cue for fruit, so HSV is kept
+    moderate). close_mosaic=10 disables mosaic for the final 10 epochs
+    so the model finishes on natural images.
+
+5.7 YOLO label format and metrics
+    Label line: <class_id> <cx> <cy> <w> <h>, all normalised to [0,1].
+    IoU = area(intersection)/area(union) of predicted and GT boxes.
+    A prediction is a TP if IoU >= threshold and class matches.
+    Precision = TP/(TP+FP), Recall = TP/(TP+FN).
+    AP = area under the precision-recall curve for one class;
+    mAP50 = mean AP at IoU 0.5; mAP50-95 = mean over IoU 0.50..0.95
+    (the strict COCO primary metric).
+
+5.8 Efficiency details
+    batch=-1 (AutoBatch) profiles memory and picks the largest batch
+    fitting ~60% of free VRAM - safe on a shared T4.
+    AMP (automatic mixed precision, FP16+FP32) is on by default:
+    ~2x throughput on Tensor Cores, roughly half the activation memory.
+    workers=2 matches Colab's 2 vCPUs; oversubscribing dataloader
+    workers on Colab measurably slows training.
+
+----------------------------------------------------------------------
+6. EXPECTED RESULTS (T4, approximate)
+----------------------------------------------------------------------
+mAP50     : ~0.85 - 0.95
+mAP50-95  : ~0.65 - 0.80
+Precision / Recall: ~0.90+
+Per-class behaviour:
+    apple, orange, banana : easiest (distinctive colour/shape), AP ~0.95+
+    grapes                : very easy (cluster shape)
+    jackfruit, papaya     : moderate (variable sizes/shapes)
+    hog plum vs mango vs guava : the main confusion pair (all greenish-
+      yellow, similar oval silhouettes) - expect most off-diagonal
+      mass in the confusion matrix here.
+Training typically stops between epoch 20 and 30 (patience=15).
+
+----------------------------------------------------------------------
+7. VIVA QUESTIONS AND ANSWERS
+----------------------------------------------------------------------
+Q1. What does this notebook do?
+    Trains a YOLOv8 object detector to localise and classify 10 fruit
+    species on the Kaggle fruits-images-dataset.
+
+Q2. What was wrong with the original dataset labels?
+    Every .txt label file used class ID `0`, so training on them as-is
+    would produce a 1-class "generic fruit" detector. The true class was
+    actually encoded in the image filename (e.g. `01_Banana.jpg`).
+
+Q3. How does this notebook fix it?
+    It scans all filenames, extracts the class name with a regex
+    (removing leading digits/underscores, lowercasing, stripping
+    spaces), builds a stable 10-class vocabulary, and rewrites every
+    label file replacing the leading `0` with the correct class ID
+    while preserving the cx/cy/w/h coordinates.
+
+Q4. Classification vs detection: outputs and metrics?
+    Classification: one label per image, measured by accuracy/F1.
+    Detection: a set of (class, box, confidence), measured by IoU-based
+    mAP. Different labels, losses and metrics.
+
+Q5. Describe the YOLOv8n architecture.
+    C2f/CSP nano backbone + SPPF -> PAN-FPN neck fusing P3/P4/P5 ->
+    anchor-free decoupled heads (separate cls and regression branches)
+    at three scales. 'n' is the smallest width/depth scaling (~3.2M
+    params).
+
+Q6. What does anchor-free mean?
+    Grid cells regress distances to box edges directly (with DFL),
+    instead of offsetting predefined anchor rectangles - fewer
+    hyperparameters and better generalisation to new object shapes.
+
+Q7. Which losses does YOLOv8 use?
+    CIoU + DFL for boxes, BCE for classes (one-vs-all per class, not
+    softmax), with the Task-Aligned Assigner choosing positive cells
+    based on combined classification score and IoU.
+
+Q8. Define IoU, mAP50 and mAP50-95.
+    IoU = intersection/union of boxes. AP = area under a class's PR
+    curve; mAP50 averages AP over classes at IoU 0.5; mAP50-95 averages
+    over IoU thresholds 0.50 to 0.95 in steps of 0.05 (stricter).
+
+Q9. What is NMS and why is it needed?
+    The grid produces many overlapping predictions for one object.
+    Non-Maximum Suppression keeps the top-scoring box and removes
+    same-class boxes overlapping it beyond an IoU threshold.
+
+Q10. Why start from yolov8n.pt (COCO) rather than random weights?
+    Transfer learning: the backbone already knows generic visual
+    features; with only 320 images, training from scratch would overfit
+    badly. Only the 10-class head is learned fresh.
+
+Q11. Explain the YOLO label file format.
+    One text file per image, one line per object:
+    class_id cx cy w h, with all box values normalised by image
+    width/height. Empty file = background-only image.
+
+Q12. Why imgsz=640 and batch=-1?
+    640 is the standard YOLO resolution balancing detail and speed.
+    batch=-1 (AutoBatch) profiles memory and picks the largest batch
+    fitting ~60% of free VRAM, maximising utilisation on a shared T4.
+
+Q13. Why workers=2?
+    Colab exposes 2 vCPUs. More dataloader processes than cores causes
+    context-switching overhead and can slow training.
+
+Q14. What augmentation does Ultralytics apply, and what is close_mosaic?
+    Mosaic (4-image stitching), scale/translate, horizontal flip, HSV
+    jitter. close_mosaic=10 turns mosaic off for the last 10 epochs so
+    training finishes on realistic single images.
+
+Q15. What does the confusion matrix's 'background' row mean?
+    Predictions with no matching GT box (false positives) or GT objects
+    the model missed (false negatives) are tallied against a synthetic
+    background class.
+
+Q16. Which classes does the model confuse most, and why?
+    hog plum, mango and guava - similar greenish-yellow colour and oval
+    silhouette at this resolution. Apple, orange, banana and grapes are
+    nearly perfectly detected.
+
+Q17. What does the first cell do?
+    Checks CUDA availability, total VRAM >= 6 GB and free VRAM >= 4 GB,
+    and raises a friendly RuntimeError otherwise - preventing a silent
+    CPU crawl or an OOM crash mid-training.
+
+Q18. Why check FREE VRAM rather than just total?
+    Another notebook/process may already occupy most of the card.
+    Checking free memory prevents an OOM crash several minutes into
+    training.
+
+Q19. How do you resume after a Colab disconnect?
+    Ultralytics saves last.pt every epoch:
+    YOLO('runs/fruit_det/weights/last.pt').train(resume=True).
+
+Q20. How would you improve accuracy further?
+    More data (especially for the confused green-fruit classes), a
+    larger backbone (yolov8s/m), test-time augmentation, or stricter
+    manual relabelling of ambiguous boxes.
+
+Q21. How is the trained detector deployed?
+    YOLO('outputs/fruits_yolov8n_det.pt').predict(image, conf=0.25) -
+    the notebook's detect_image() wraps this and returns
+    (class, confidence, xyxy) tuples; export to ONNX/TensorRT is one
+    call (model.export) if needed.
+
+----------------------------------------------------------------------
+8. QUICK TROUBLESHOOTING
+----------------------------------------------------------------------
+'GPU CHECK FAILED' box      -> enable the T4 runtime / free VRAM,
+                               restart the kernel, Run all again.
+'DATASET DOWNLOAD FAILED'   -> add KAGGLE_API_TOKEN secret.
+Only 1 class detected       -> you bypassed the label-rewriting cell;
+                               re-run Cell 3 to rebuild fruits_yolo/.
+CUDA OOM during training    -> restart session; or set batch=16 and
+                               imgsz=512 instead of batch=-1/640.
+mAP lower than expected     -> check the confusion matrix; if hog plum
+                               / mango / guava are heavily confused,
+                               that is the dataset's visual limit at
+                               this model size.
+======================================================================

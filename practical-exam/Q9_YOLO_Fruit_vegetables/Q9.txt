@@ -1,0 +1,168 @@
+======================================================================
+PS9 : FRUIT AND VEGETABLE CLASSIFICATION USING YOLO
+Notebook: ps09_yolo_fruits_vegetables.ipynb
+======================================================================
+
+----------------------------------------------------------------------
+1. PROBLEM STATEMENT (PS) AND THE DATASET REALITY
+----------------------------------------------------------------------
+PS9: "Object Detection using YOLO - Fruits and vegetables"
+Dataset: https://www.kaggle.com/datasets/kritikseth/fruit-and-vegetable-image-recognition
+
+THE CATCH: this dataset is an IMAGE CLASSIFICATION dataset. It contains
+36 class folders (apple, banana, cabbage, etc.) but NO bounding-box
+annotations. A detector cannot be trained on it directly.
+
+This notebook solves PS9 honestly using YOLO's CLASSIFICATION task
+(yolov8n-cls). YOLO is a multi-task framework (detect, segment,
+classify, pose, obb). Since the dataset only provides folder labels,
+the classification head is the only valid supervision.
+
+Task type : 36-class single-label image classification
+Input     : RGB fruit/vegetable photo, resized to 224x224
+Output    : softmax probabilities over 36 classes
+Metrics   : top-1 / top-5 accuracy (NOT mAP - there are no boxes).
+
+----------------------------------------------------------------------
+3. DATASET FACTS
+----------------------------------------------------------------------
+Total: ~3,825 images across 36 classes.
+Official split provided by the dataset:
+  train/      : ~3,115 images (~100 per class)
+  validation/ :   351 images (10 per class) 
+  test/       :   359 images (10 per class)
+
+Classes: apple, banana, beetroot, bell pepper, cabbage, capsicum,
+carrot, cauliflower, chilli pepper, corn, cucumber, eggplant, garlic,
+ginger, grapes, jalepeno, kiwi, lemon, lettuce, mango, onion, orange,
+paprika, pear, peas, pineapple, pomegranate, potato, raddish, soy beans,
+spinach, sweetcorn, sweetpotato, tomato, turnip, watermelon.
+
+----------------------------------------------------------------------
+4. CELL-BY-CELL CODE COMMENTS
+----------------------------------------------------------------------
+
+--- Cell 1: GPU / VRAM gate -------------------------------------------
+Checks CUDA availability and free VRAM. Raises a friendly RuntimeError
+if requirements (>= 4 GB total, >= 2 GB free) are not met.
+
+--- Cell 2: Config + Cloud Sync Warning -------------------------------
+Sets BATCH=128 and WORKERS=4 for maximum hardware utilization.
+Checks the current working directory path. If it contains "onedrive",
+"dropbox", or "google drive", it prints a warning advising the user to
+move the project to a local, non-synced folder like C:\datasets\.
+
+--- Cell 3: Dataset discovery -----------------------------------------
+Checks if running on Kaggle. If so, copies to writable directory.
+Otherwise, downloads via kagglehub.
+Renames `validation` -> `val` to satisfy Ultralytics.
+
+--- Cell 6: training --------------------------------------------------
+YOLO('yolov8n-cls.pt')           # ImageNet-1k pretrained nano classifier
+.train(data=DATA, epochs=15, imgsz=224, batch=128,
+       workers=4, seed=42,
+       patience=5,               # early stop if val fitness stalls
+       cache='ram',              # CRITICAL: Bypasses disk I/O bottlenecks
+       project='runs', name='veg_cls', exist_ok=True)
+
+--- Cell 8: official test evaluation + plots --------------------------
+model.val(data=..., split='test')  # evaluates on the HELD-OUT test set
+metrics.top1 / metrics.top5        # headline accuracies
+
+--- Cell 11: save + single-image inference ----------------------------
+Copies best.pt -> outputs/fruits_vegs_yolov8n_cls.pt
+classify_image(path, top_k=3): returns a dict of the top-k probabilities.
+
+----------------------------------------------------------------------
+5. MODEL THEORY
+----------------------------------------------------------------------
+5.1 YOLO as a multi-task framework
+    Ultralytics YOLOv8 shares a backbone family across tasks: detect
+    (boxes), segment (masks), classify (label), pose, obb. The task is
+    selected by the weights file ('yolov8n-cls.pt') and the data format.
+
+5.2 YOLOv8n-cls architecture
+    Backbone: CSP-style C2f blocks with stride-2 convolutions -> feature
+    pyramid; 'n' (nano) is the smallest depth/width scaling.
+    Head (Classify): 1x1 conv to 1280 channels -> global average
+    pooling (GAP) to a 1280-d vector -> dropout -> Linear(1280, 36).
+    Size: ~1.48M parameters, ~3.4 GFLOPs at 224x224.
+
+5.3 RAM Caching vs Disk I/O
+    In deep learning, the GPU can only process data as fast as the CPU
+    can feed it. If images are stored on a slow HDD, a network drive,
+    or a cloud-synced folder (OneDrive), the GPU spends most of its
+    time idle (starvation). Setting `cache='ram'` shifts the bottleneck
+    from Disk I/O to System RAM bandwidth, which is orders of magnitude
+    faster, ensuring 100% GPU utilization.
+
+----------------------------------------------------------------------
+6. EXPECTED RESULTS (Local 15GB GPU, approximate)
+----------------------------------------------------------------------
+With cache='ram' and batch=128, Epoch 1 will take ~1 minute (RAM loading).
+Epochs 2-15 will take ~10-15 seconds EACH.
+Total training time: < 5 minutes.
+
+Test top-1 accuracy : ~0.92 - 0.96
+Test top-5 accuracy : ~0.98 - 0.99
+Per-class behaviour:
+    Distinctive items (pineapple, watermelon, corn, banana) : ~98%+
+    Leafy greens (lettuce, spinach, cabbage)                : moderate
+    Pepper family (bell pepper, capsicum, chilli, paprika)  : the main
+      confusion cluster (similar shapes, colour variants)
+
+----------------------------------------------------------------------
+7. VIVA QUESTIONS AND ANSWERS
+----------------------------------------------------------------------
+Q1. What does this notebook do?
+    Trains YOLOv8's classification model (yolov8n-cls) to recognise 36
+    fruit and vegetable species, then evaluates it on a held-out test
+    set with top-1/top-5 accuracy and a confusion matrix.
+
+Q2. The PS says "object detection" - why classification?
+    The dataset contains only folder labels, no bounding boxes.
+    Detection cannot be supervised without boxes. YOLO is a multi-task
+    framework, so we use its classification head.
+
+Q3. Why was training slow on your local machine initially?
+    The project was located inside a OneDrive folder. Background cloud
+    sync locks files, destroying disk I/O and forcing the dataloader to
+    0 workers. This starved the GPU, causing it to use only ~1.7GB of
+    its 15GB capacity.
+
+Q4. How did you fix the I/O bottleneck?
+    By adding `cache='ram'` to the training arguments. This loads the
+    entire dataset (~150MB) into System RAM on Epoch 1. Subsequent
+    epochs read directly from RAM, completely bypassing the slow disk
+    and cloud sync locks.
+
+Q5. Why increase the batch size to 128?
+    A batch size of 16 is too small for a 15GB GPU. Increasing it to
+    128 saturates the VRAM, allowing the GPU to perform larger, more
+    efficient parallel matrix multiplications, drastically reducing
+    epoch time.
+
+Q6. Describe the YOLOv8n-cls architecture.
+    C2f/CSP nano backbone -> 1x1 conv to 1280 channels -> global average
+    pooling -> dropout -> Linear(1280, 36) softmax. ~1.48M parameters.
+
+Q7. Why start from yolov8n-cls.pt instead of random weights?
+    Transfer learning from ImageNet-1k. The backbone already knows
+    generic visual features; only the 36-class head is new.
+
+Q8. Why is the head only ~46k parameters?
+    Global average pooling reduces the feature map to a 1280-d vector,
+    so the classifier is just 1280*36 + 36. Flattening the spatial map
+    instead would add hundreds of thousands of parameters and overfit.
+
+Q9. What is top-5 accuracy and why is it useful here?
+    True class among the 5 highest-probability predictions. With 36
+    classes that have visual overlap (e.g. capsicum vs bell pepper),
+    top-5 captures "the model knew the category but missed the exact
+    variant", which top-1 penalises fully.
+
+Q10. Which classes does the model confuse most, and why?
+    The pepper family (bell pepper, capsicum, chilli pepper, paprika)
+    and leafy greens (lettuce, spinach, cabbage) - similar shapes and
+    colour variants at 224px resolution.
+======================================================================

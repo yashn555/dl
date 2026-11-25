@@ -1,0 +1,424 @@
+======================================================================
+PS7 : FLOWER CLASSIFICATION USING YOLO (YOLOv8 CLASSIFICATION MODE)
+Notebook: ps07_yolo_flowers_classification.ipynb
+Dataset : https://www.kaggle.com/datasets/imsparsh/flowers-dataset
+======================================================================
+
+----------------------------------------------------------------------
+1. PROBLEM STATEMENT (PS) AND TASK FORMULATION
+----------------------------------------------------------------------
+PS7: "Object Detection using YOLO - Flowers detection" on the imsparsh
+flowers dataset.
+
+This notebook solves PS7 with YOLO's CLASSIFICATION task
+(yolov8n-cls), which is the correct formulation for this dataset:
+
+  - The dataset provides FOLDER LABELS (daisy, dandelion, rose,
+    sunflower, tulip) and NO bounding-box annotations.
+  - Detection requires boxes; classification requires only labels.
+  - YOLO is a multi-task framework: the same backbone family supports
+    detect / segment / classify / pose / obb. The '-cls' models replace
+    the detection head with a classification head, so we are still
+    training a YOLO network - just with the head that matches the
+    available supervision.
+
+Task type : 5-class single-label image classification
+Input     : RGB flower photo, resized to 224x224
+Output    : softmax probabilities over 5 flower classes
+Metrics   : top-1 / top-5 accuracy, per-class precision/recall/F1,
+            macro F1, confusion matrix (NOT mAP - there are no boxes).
+
+----------------------------------------------------------------------
+2. DATASET FACTS
+----------------------------------------------------------------------
+Total: 3,670 images, ~218 MB, 5 classes.
+  train/ (folder-labelled): 2,746 images
+      daisy 501, dandelion 646, rose 497, sunflower 495, tulip 607
+  test/ : 924 UNLABELED images (competition-style) -> used only for
+          qualitative prediction demos, never for metrics.
+
+Split created by the notebook: 80/20 PER CLASS, seed 42:
+      daisy      train 401 / val 100
+      dandelion  train 517 / val 129
+      rose       train 398 / val  99
+      sunflower  train 396 / val  99
+      tulip      train 486 / val 121
+      TOTAL      train 2198 / val 548
+Per-class (stratified) splitting keeps the class balance identical in
+both splits; the fixed seed makes the split reproducible.
+
+----------------------------------------------------------------------
+3. HOW TO RUN
+----------------------------------------------------------------------
+Requirements: ultralytics + kagglehub (installed by the notebook),
+OpenCV / matplotlib / seaborn / scikit-learn (preinstalled on Colab),
+a Kaggle API token, and (by default) a CUDA GPU.
+
+ 1. Colab: Runtime > Change runtime type > T4 GPU.
+ 2. Add your Kaggle token as a Colab Secret named KAGGLE_API_TOKEN
+    (or set DATA_DIR in the setup cell to a local copy of the dataset).
+ 3. Runtime > Run all.
+
+GPU/VRAM GATE (first cell):
+  - REQUIRE_GPU = True (default): if no CUDA GPU is visible, or free
+    VRAM < 2 GB, the cell raises a RuntimeError with a boxed,
+    actionable message and Run-all stops immediately.
+  - REQUIRE_GPU = False: explicit opt-out for CPU training. This task
+    is light (224px, nano model), so CPU is genuinely viable - just
+    slower. The flag makes that choice deliberate rather than silent.
+
+Approximate runtime:
+  T4 GPU : ~3-5 min total (20 epochs @224, batch 64, ~8-12 s/epoch;
+           patience=10 may stop earlier) + ~1 min evaluation/plots.
+  CPU    : ~10-15 min for the same run.
+Peak VRAM: roughly 1-1.5 GB at batch 64 with AMP.
+
+Disconnect insurance: Ultralytics writes runs/flower_cls/weights/
+last.pt every epoch. Resume with:
+    YOLO('runs/flower_cls/weights/last.pt').train(resume=True)
+Copy flowers_cls/, runs/ and outputs/ to Google Drive to persist them
+across sessions.
+
+----------------------------------------------------------------------
+4. CELL-BY-CELL CODE COMMENTS (the notebook itself has no comments)
+----------------------------------------------------------------------
+
+--- Cell 1: GPU / VRAM gate -------------------------------------------
+import torch                    # Colab ships CUDA-enabled PyTorch
+REQUIRE_GPU = True              # default: terminate if no GPU
+MIN_FREE_VRAM_GB = 2.0          # headroom for batch 64 @224 + AMP
+_gpu_fail()                     # boxed Problem/Fix message inside a
+                                # RuntimeError -> halts Run-all cleanly
+torch.cuda.is_available()       # no GPU -> fail (or warn if opt-out)
+get_device_properties(0)        # physical VRAM of GPU 0
+torch.cuda.mem_get_info(0)[0]   # FREE VRAM right now - catches other
+                                # notebooks/processes hogging memory
+# Checking FREE (not just total) memory prevents a mid-training OOM
+# when another session already occupies most of the card.
+
+--- Cell 2: install + imports + configuration -------------------------
+%pip install -q ultralytics kagglehub
+random/shutil/Path              # split copying, filesystem
+cv2                             # image loading for EDA (BGR)
+matplotlib / seaborn            # plots, confusion-matrix heatmap
+sklearn metrics                 # classification_report, CM, macro F1
+YOLO                            # Ultralytics model API
+
+SEED=42          : reproducible split + training
+DATA_DIR=None    : None -> auto-download; else a local dataset path
+KAGGLE_DATASET   : 'imsparsh/flowers-dataset'
+VAL_FRACTION=0.2 : 80/20 stratified split
+EPOCHS=20        : upper bound; patience=10 early-stops on val fitness
+IMG=224          : standard classification resolution (ImageNet style)
+BATCH=64         : good GPU utilisation, fits ~1.5 GB with AMP
+WORKERS=2        : Colab has 2 vCPUs; more workers slows things down
+
+--- Cell 3: dataset acquisition + inventory ---------------------------
+kagglehub.dataset_download(...)  # cached ~218 MB download, returns root
+# on failure: boxed message with two fixes, then SystemExit (fail fast)
+root.rglob('daisy')              # locate the class-folder root no matter
+                                 # how the archive nested it
+class_names = sorted(subfolders) # alphabetical -> daisy=0 ... tulip=4
+files = {class: [image paths]}   # flat inventory per class
+test_files = the 924 unlabeled test images (demo only)
+# Prints per-class counts as a sanity check before any training.
+
+--- Cell 4: EDA -------------------------------------------------------
+Bar chart of class counts (mild imbalance: 495-646 per class - not
+severe enough to need class weights).
+One sample image per class (cv2 BGR -> RGB) verifies the download and
+the folder-to-label mapping visually.
+
+--- Cell 6: build the YOLO classification split -----------------------
+YOLO classification expects:  data/train/<class>/*.jpg
+                              data/val/<class>/*.jpg
+For each class: seeded shuffle, first 20% -> val, rest -> train,
+copy into flowers_cls/{train,val}/<class>/.
+- Stratified per class -> identical class proportions in both splits.
+- Idempotent (skips existing files) -> safe to re-run.
+- Prints the per-class train/val counts (401/100, 517/129, ...).
+
+--- Cell 8: training --------------------------------------------------
+YOLO('yolov8n-cls.pt')           # ImageNet-1k pretrained nano classifier
+.train(data=flowers_cls, epochs=20, imgsz=224, batch=64,
+       workers=2, seed=42,
+       patience=10,              # early stop if val fitness (top-1)
+                                 # does not improve for 10 epochs
+       project='runs', name='flower_cls', exist_ok=True)
+Ultralytics automatically:
+  - overrides nc=1000 -> nc=5 and transfers matching pretrained weights
+    (log: "Transferred 156/158 items"),
+  - picks the optimizer via 'auto' (typically AdamW, lr ~0.0011,
+    weight decay 5e-4) with a 3-epoch warmup,
+  - enables AMP (mixed precision),
+  - applies classification augmentations (RandAugment, random resized
+    crop, horizontal flip, random erasing, HSV jitter),
+  - validates every epoch and saves best.pt / last.pt + results.csv
+    + results.png + confusion_matrix.png.
+save_dir = model.trainer.save_dir  # where all artifacts live
+
+--- Cell 10: official validation + training plots ---------------------
+model.val(data=..., split='val')  # recomputes with the BEST weights
+metrics.top1 / metrics.top5       # headline accuracies
+# top-5 is trivially 1.0 with exactly 5 classes - top-1 is the metric
+# that matters.
+Displays results.png (loss/accuracy curves) and confusion_matrix.png
+(Ultralytics' own matrix over the 5 classes).
+
+--- Cell 11: per-class report + seaborn confusion matrix --------------
+val_paths = all 548 validation images; y_true = parent folder name
+model.predict(list_of_paths)      # batched GPU inference, one pass
+y_pred = r.names[r.probs.top1]    # winning class per image
+classification_report(labels=class_names, zero_division=0)
+                                  # precision/recall/F1/support per class
+f1_score(average='macro')         # single balanced headline number
+sns.heatmap(confusion_matrix(...))# rows actual, columns predicted
+# This complements Ultralytics' plots with a standard sklearn report.
+
+--- Cell 12: qualitative validation check -----------------------------
+8 random val images; title shows P:<predicted> (<confidence>) and
+A:<actual>; green = correct, red = wrong. r.orig_img is BGR, so
+[..., ::-1] converts to RGB for matplotlib.
+
+--- Cell 13: unlabeled test demo --------------------------------------
+If test/ exists, classify 4 of its 924 UNLABELED images and show the
+predicted class + confidence. No metrics are computed or claimed there
+(there is no ground truth) - it is a generalisation showcase.
+
+--- Cell 15: save + single-image inference ----------------------------
+Copies runs/flower_cls/weights/best.pt -> outputs/flowers_yolov8n_cls.pt
+classify_image(path, top_k=3):
+    one-image predict; displays the photo with the winning class and
+    confidence; returns a dict of the top-k {class: probability}.
+    probs.data is the full softmax vector; probs.top5 the ranked ids.
+Reload anywhere with:  YOLO('outputs/flowers_yolov8n_cls.pt')
+
+----------------------------------------------------------------------
+5. MODEL THEORY
+----------------------------------------------------------------------
+5.1 YOLO as a multi-task framework
+    "You Only Look Once" is famous as a one-stage DETECTOR, but
+    Ultralytics YOLOv8 ships task variants sharing the same backbone
+    design: detect (boxes), segment (masks), classify (label), pose
+    (keypoints), obb (rotated boxes). The task is selected by the
+    weights file ('yolov8n-cls.pt') and the data format. With folder
+    labels and no boxes, classification is the only valid supervision.
+
+5.2 YOLOv8n-cls architecture
+    Backbone: CSP-style C2f blocks (cross-stage partial connections)
+      with stride-2 convolutions -> feature pyramid; 'n' (nano) is the
+      smallest depth/width scaling.
+    Head (Classify): 1x1 conv to 1280 channels -> global average
+      pooling to a 1280-d vector -> dropout -> Linear(1280, 5).
+    Size: ~1.44M parameters, ~3.4 GFLOPs at 224x224 - tiny by modern
+    standards, which is exactly right for ~2,200 training images.
+    The final linear layer has only 1280*5 + 5 = 6,405 parameters;
+    GAP is what keeps the head small (a Flatten of the last feature
+    map would need hundreds of thousands).
+
+5.3 Transfer learning
+    yolov8n-cls.pt is pretrained on ImageNet-1k (1000 classes).
+    Loading it with 5 classes overrides nc and re-initialises only the
+    final linear layer; ~156/158 weight tensors transfer directly.
+    The backbone already encodes edges, textures, petal shapes and
+    colour statistics, so 20 epochs on 2,198 images suffice to reach
+    ~95% accuracy. Training from scratch on this data would overfit.
+
+5.4 Objective and optimisation
+    Loss: cross-entropy over the 5-way softmax, L = -log p(true class).
+    Optimizer: 'auto' -> AdamW (lr ~1.1e-3, weight decay 5e-4) for
+    classification fine-tuning, with a 3-epoch warmup and a decaying
+    schedule (lrf). AdamW decouples weight decay from the adaptive
+    step, which regularises small-data fine-tuning well.
+    AMP (automatic mixed precision): FP16 compute + FP32 master
+    weights with loss scaling - faster on Tensor Cores, less VRAM.
+
+5.5 Classification augmentations (why val can beat train early)
+    RandAugment (random chains of photometric/geometric ops),
+    RandomResizedCrop (scale jitter), horizontal flip (p=0.5),
+    random erasing (p=0.4, occlusion robustness), HSV jitter.
+    These make TRAIN images harder than clean VAL images, so early
+    val accuracy can exceed train accuracy - normal, not a bug.
+    Mosaic/mixup are detection-oriented and are not used for cls.
+
+5.6 Global average pooling vs flatten
+    GAP averages each of the 1280 final feature maps to one number:
+    zero parameters, spatially robust, strong regularisation. It is
+    the standard ImageNet-classifier design and the reason the head
+    is only 6,405 parameters.
+
+5.7 Metrics
+    top-1: fraction where argmax(softmax) == true class.
+    top-5: true class among the 5 highest scores - with exactly 5
+           classes this is ALWAYS 1.0, so report top-1.
+    Precision_c = TP/(TP+FP); Recall_c = TP/(TP+FN); F1 = harmonic mean.
+    Macro F1 = unweighted mean over classes (fair under mild imbalance).
+    Confusion matrix: rows actual, columns predicted; diagonal correct.
+    No mAP/IoU here - those require bounding boxes.
+
+5.8 Early stopping and checkpointing
+    patience=10 monitors validation fitness (top-1 for cls); training
+    stops after 10 stagnant epochs and best.pt (the best-epoch weights)
+    is what val()/predict() use. last.pt is written every epoch for
+    crash/disconnect resume.
+
+5.9 Efficiency choices
+    imgsz=224: classification needs recognition, not localisation -
+    224 is the ImageNet convention and 8x cheaper than 640.
+    batch=64: stable gradients, ~1-1.5 GB VRAM with AMP.
+    workers=2: matches Colab's 2 vCPUs; oversubscribing slows input.
+
+----------------------------------------------------------------------
+6. EXPECTED RESULTS (approximate)
+----------------------------------------------------------------------
+Top-1 validation accuracy : ~0.94 - 0.96
+Top-5 validation accuracy : 1.000 (by construction, 5 classes)
+Macro F1                  : ~0.94 - 0.96
+Per-class behaviour:
+    daisy / sunflower : easiest (distinctive shape + colour), F1 ~0.96+
+    dandelion         : strong, occasional confusion with daisy
+    rose vs tulip     : the main confusion pair (red, similar cup
+                        silhouette) - expect most off-diagonal mass here
+Training typically converges by epoch 10-15; patience=10 stops it.
+The unlabeled test demo should show confident, sensible predictions.
+
+----------------------------------------------------------------------
+7. VIVA QUESTIONS AND ANSWERS
+----------------------------------------------------------------------
+Q1. What does this notebook do?
+    Trains YOLOv8's classification model (yolov8n-cls) to recognise 5
+    flower species from the imsparsh Kaggle dataset, then evaluates it
+    with accuracy, per-class F1 and a confusion matrix.
+
+Q2. The PS says "object detection" - why classification?
+    The dataset contains only folder labels, no bounding boxes.
+    Detection cannot be supervised without boxes. YOLO is a multi-task
+    framework, so we use its classification head - still a YOLO model,
+    matched to the available labels.
+
+Q3. Is YOLO only a detector?
+    No. Ultralytics YOLOv8 supports detect, segment, classify, pose and
+    obb tasks with a shared backbone family; the weights file and data
+    format select the task.
+
+Q4. Classification vs detection: outputs and metrics?
+    Classification: one label per image, measured by accuracy/F1.
+    Detection: a set of (class, box, confidence), measured by IoU-based
+    mAP. Different labels, losses and metrics.
+
+Q5. Describe the YOLOv8n-cls architecture.
+    C2f/CSP nano backbone -> 1x1 conv to 1280 channels -> global average
+    pooling -> dropout -> Linear(1280, 5) softmax. ~1.44M parameters,
+    ~3.4 GFLOPs at 224x224.
+
+Q6. What does the 'n' mean?
+    Nano - the smallest depth/width scaling of the YOLOv8 family
+    (n < s < m < l < x). Right-sized for ~2,200 images and a lab GPU.
+
+Q7. Why start from yolov8n-cls.pt instead of random weights?
+    Transfer learning from ImageNet-1k. The backbone already knows
+    generic visual features; only the 5-class head is new. The log
+    shows nc overridden 1000->5 and ~156/158 tensors transferred.
+
+Q8. Which loss and optimizer are used?
+    Cross-entropy on the 5-way softmax. optimizer='auto' selects AdamW
+    (lr ~0.0011, weight decay 5e-4) with a 3-epoch warmup and decaying
+    schedule - well suited to small-data fine-tuning.
+
+Q9. Why is the head only ~6,405 parameters?
+    Global average pooling reduces the feature map to a 1280-d vector,
+    so the classifier is just 1280*5 + 5. Flattening the spatial map
+    instead would add hundreds of thousands of parameters and overfit.
+
+Q10. What augmentations are applied, and why no mosaic?
+    RandAugment, random resized crop, horizontal flip, random erasing,
+    HSV jitter. Mosaic/mixup are detection-oriented (multi-object
+    context) and are not used for classification.
+
+Q11. Why can validation accuracy exceed training accuracy early on?
+    Augmentation makes training images harder than clean validation
+    images; dropout is also active only during training. It is normal.
+
+Q12. What is top-5 accuracy and why is it exactly 1.0 here?
+    True class among the 5 highest-probability predictions. With only
+    5 classes, that is always true - so top-1 is the meaningful metric.
+
+Q13. Which single number would you report, and why?
+    Top-1 accuracy plus macro F1 (and the confusion matrix). Macro F1
+    weights every class equally, which is fair under the mild class
+    imbalance (495-646 images per class).
+
+Q14. How do you read the confusion matrix? Which classes confuse?
+    Rows = actual, columns = predicted; diagonal = correct. The main
+    errors are rose <-> tulip (similar red cup-shaped blooms); daisy
+    and sunflower are the most reliably recognised.
+
+Q15. Why imgsz=224 and not 640?
+    Classification needs recognition, not localisation. 224 is the
+    ImageNet convention and ~8x cheaper per image than 640, with no
+    accuracy penalty for this task.
+
+Q16. Why batch=64 and workers=2?
+    64 gives stable gradients and fits ~1-1.5 GB VRAM with AMP.
+    workers=2 matches Colab's 2 vCPUs; more dataloader processes than
+    cores causes context-switching overhead.
+
+Q17. What does patience=10 do?
+    Early stopping: if validation fitness (top-1) does not improve for
+    10 epochs, training stops; best.pt holds the best-epoch weights and
+    is used for all evaluation and inference.
+
+Q18. What is AMP?
+    Automatic mixed precision: FP16 compute with FP32 master weights
+    and automatic loss scaling - faster on Tensor-Core GPUs and lower
+    memory, with no meaningful accuracy loss.
+
+Q19. What does the first cell do, and what is REQUIRE_GPU?
+    It checks CUDA availability and free VRAM (>= 2 GB) and raises a
+    friendly RuntimeError otherwise, stopping Run-all. REQUIRE_GPU can
+    be set to False to deliberately train on CPU, which is viable for
+    this light workload (~10-15 min).
+
+Q20. Why check FREE VRAM rather than just total?
+    Another notebook/process may already occupy most of the card.
+    Checking free memory prevents an OOM crash several minutes into
+    training.
+
+Q21. How is the stratified split made and why does it matter?
+    Each class is shuffled with seed 42 and split 80/20 independently,
+    so train and val have identical class proportions and the split is
+    reproducible. No image appears in both.
+
+Q22. How would you improve accuracy further?
+    More data / stronger backbone (yolov8s-cls), longer training with
+    cosine LR, test-time augmentation, ensembling, or fine-tuning a
+    larger ImageNet model (EfficientNet/ConvNeXt). Cleaning ambiguous
+    rose/tulip images would also help.
+
+Q23. How is the trained model reused or deployed?
+    YOLO('outputs/flowers_yolov8n_cls.pt').predict(image) - the
+    notebook's classify_image() wraps this and returns top-k
+    probabilities. model.export(format='onnx') gives a portable
+    deployment artifact.
+
+Q24. Why are no metrics computed on the Kaggle test folder?
+    Its 924 images are unlabeled (competition-style). Without ground
+    truth, accuracy/F1 are undefined - it is used only for qualitative
+    prediction demos.
+
+----------------------------------------------------------------------
+8. QUICK TROUBLESHOOTING
+----------------------------------------------------------------------
+'GPU CHECK FAILED' box     -> enable the T4 runtime / free VRAM, restart
+                              the kernel, Run all again. To train on
+                              CPU deliberately, set REQUIRE_GPU = False.
+'DATASET DOWNLOAD FAILED'  -> add KAGGLE_API_TOKEN secret, or set
+                              DATA_DIR to a local copy with train/<class>.
+Slow epochs (>60 s)        -> you are on CPU; switch to a GPU runtime.
+CUDA OOM                   -> restart session; or lower BATCH to 32.
+Val accuracy stuck ~0.20   -> class folders mis-mapped; check the EDA
+                              grid and the printed class list.
+Resume after disconnect    -> YOLO('runs/flower_cls/weights/last.pt')
+                              .train(resume=True); persist runs/ and
+                              flowers_cls/ to Drive.
+======================================================================

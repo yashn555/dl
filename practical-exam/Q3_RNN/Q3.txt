@@ -1,0 +1,599 @@
+=====================================================================
+PS3 : IMPLEMENT AN RNN TO GENERATE TEXT BASED ON A CORPUS OF TEXT
+Model : SimpleRNN (Vanilla Recurrent Neural Network) - NOT LSTM / GRU
+Task  : Character-level language modelling + text generation
+Corpus: Shakespeare (auto-downloaded), first 200,000 characters
+=====================================================================
+
+
+---------------------------------------------------------------------
+1. PROBLEM STATEMENT
+---------------------------------------------------------------------
+Build and train a Recurrent Neural Network that learns the statistical
+structure of a given text corpus and then generates NEW text, one
+character at a time, that resembles the style of that corpus.
+
+Input  : a seed string of characters (context / prompt)
+Output : the next character, repeatedly, to produce generated text
+
+The network is trained as a language model:
+    P(next_character | previous 40 characters)
+Generation is then done by repeatedly sampling from this learned
+distribution and feeding the sampled character back as input
+(autoregressive generation).
+
+Constraint satisfied: the recurrent layer used is
+tf.keras.layers.SimpleRNN, i.e. a plain Elman RNN. No LSTM, no GRU.
+
+
+---------------------------------------------------------------------
+2. WHY AN RNN FOR THIS TASK
+---------------------------------------------------------------------
+- Text is a SEQUENCE. The meaning / probability of the next character
+  depends on the ORDER of previous characters, not just their presence.
+- A Dense network needs a fixed-size input and treats positions
+  independently; a CNN captures only local n-gram patterns.
+- An RNN processes the sequence one step at a time and carries a
+  HIDDEN STATE (a memory vector) forward, so information from all
+  previous characters is available at the current step.
+- The SAME weights are reused at every time step (parameter sharing),
+  so the model generalises across positions and handles variable
+  length input.
+
+
+---------------------------------------------------------------------
+3. MODEL THEORY - SimpleRNN
+---------------------------------------------------------------------
+3.1 Recurrence equation (what one SimpleRNN cell computes)
+
+    h_t = tanh( W_xh * x_t  +  W_hh * h_{t-1}  +  b_h )
+
+    x_t      : input vector at time t (here: 64-dim character embedding)
+    h_{t-1}  : previous hidden state (256-dim)
+    h_t      : new hidden state (256-dim) = "memory so far"
+    W_xh     : input-to-hidden weights   (64 x 256)
+    W_hh     : hidden-to-hidden weights  (256 x 256)  <- the recurrence
+    b_h      : bias (256)
+    tanh     : non-linearity, squashes state to (-1, 1)
+    h_0      : initialised to all zeros
+
+    "Simple" / "Vanilla" / "Elman" RNN = this single equation, no gates.
+
+3.2 Output head (many-to-one)
+
+    Only the FINAL hidden state h_T is used:
+        logits = W_hy * h_T + b_y        (256 -> 37)
+        p      = softmax(logits)         (37 probabilities)
+
+    softmax(z_i) = exp(z_i) / sum_j exp(z_j)
+    -> a valid probability distribution over the 37 characters.
+
+3.3 Training objective
+
+    Loss = sparse categorical cross-entropy
+         = -log( p[true_next_char] )
+    averaged over the batch.
+    Minimising it = maximising the likelihood of the real next character.
+
+3.4 How training works: BPTT (Backpropagation Through Time)
+
+    The RNN is "unrolled" into a 40-step feed-forward chain and
+    gradients are backpropagated through all 40 steps. The gradient
+    w.r.t. early steps contains a product of ~40 copies of W_hh and
+    tanh' terms.
+
+3.5 Vanishing / exploding gradient (key limitation)
+
+    tanh'(z) <= 1, so repeated multiplication shrinks gradients
+    exponentially -> VANISHING gradient -> the network cannot learn
+    long-range dependencies (e.g. matching a bracket 200 chars ago).
+    If the spectral radius of W_hh > 1, gradients can instead EXPLODE.
+
+    Standard remedies: gradient clipping, orthogonal initialisation,
+    ReLU, or gated cells (LSTM / GRU) which add an additive cell-state
+    path so gradients can flow unchanged.
+
+    WHY SimpleRNN IS STILL ACCEPTABLE HERE:
+    - Context window is only 40 characters -> short dependency range.
+    - Character-level English needs mostly LOCAL structure: spelling,
+      common suffixes, spaces, line breaks, speaker-name format.
+    - 40 steps of BPTT is well within what a vanilla RNN can handle.
+    - Far fewer parameters and much faster per epoch than LSTM
+      (LSTM has 4 gates => ~4x the parameters and compute).
+
+3.6 RNN vs LSTM vs GRU (comparison table)
+
+    Feature            SimpleRNN        GRU              LSTM
+    Gates              none             2 (update,reset) 3 (forget,in,out)
+    States             h                h                h and c
+    Params per unit    ~1x              ~3x              ~4x
+    Long-term memory   weak             good             best
+    Speed              fastest          medium           slowest
+    Used in this PS    YES              no               no
+
+
+---------------------------------------------------------------------
+4. ARCHITECTURE USED (with shapes and parameter counts)
+---------------------------------------------------------------------
+Vocabulary V = 37 characters, embedding dim E = 64, units U = 256,
+sequence length T = 40.
+
+Layer                     Output shape        Parameters
+--------------------------------------------------------------
+Input                     (None, None)        0
+Embedding(37, 64)         (None, None, 64)    37*64              = 2,368
+SimpleRNN(256)            (None, 256)         (64+256)*256 + 256 = 82,176
+Dense(37, softmax)        (None, 37)          256*37 + 37        = 9,509
+--------------------------------------------------------------
+TOTAL trainable parameters                                      = 94,053
+
+SimpleRNN breakdown:
+    W_xh : 64 * 256  = 16,384
+    W_hh : 256 * 256 = 65,536
+    b_h  : 256
+    total            = 82,176
+
+Data shapes:
+    X : (66654, 40)   integer character ids, dtype int
+    y : (66654,)      integer id of the next character
+    train / val split 90 / 10 -> 59,988 train, 6,666 validation
+    steps per epoch = ceil(59988 / 128) = 469
+
+
+---------------------------------------------------------------------
+5. CELL-BY-CODE EXPLANATION (these are the "comments")
+---------------------------------------------------------------------
+
+CELL 1 (markdown)
+    Title of the practical.
+
+CELL 2 - imports and configuration
+    matplotlib.pyplot : plotting loss / accuracy curves.
+    numpy             : array building and probability sampling.
+    tensorflow.keras  : model, layers, dataset download utility.
+    EPOCHS  = 15      : number of full passes over the training data.
+                        15 is enough for the loss to plateau (~1.9).
+    SEQ_LEN = 40      : context length. Each training example is
+                        40 characters -> predict the 41st.
+                        Short window keeps BPTT stable for a vanilla RNN.
+
+CELL 3 - corpus download and vocabulary
+    keras.utils.get_file(...)
+        Downloads shakespeare.txt once and caches it locally
+        (~/.keras/datasets). No manual dataset handling needed.
+    .read().lower()
+        Lower-casing merges 'A' and 'a', shrinking the vocabulary
+        (65 -> 37 symbols) so the model has fewer classes to learn and
+        more examples per class.
+    [:200000]
+        Keeps the first 200k characters. This keeps X small enough to
+        fit in RAM as a dense NumPy array and keeps one epoch a few
+        seconds. It is a deliberate speed/quality trade-off.
+    chars = sorted(set(text))
+        The vocabulary: every distinct character, sorted so the
+        id assignment is deterministic across runs.
+    char_to_id = {c: i ...}
+        Character -> integer index lookup. The list `chars` itself is
+        the reverse map (id -> character), used as chars[index].
+    print(...)
+        Sanity check: corpus size, vocabulary size, first 300 chars.
+
+CELL 4 - building supervised training pairs
+    encoded = np.array([char_to_id[c] for c in text])
+        Whole corpus converted to a 1-D array of integer ids.
+    starts = range(0, len(encoded) - SEQ_LEN, 3)
+        Sliding window with STRIDE 3. Every 3rd position becomes a
+        training example. Stride 1 would give ~200k almost-duplicate
+        windows (3x memory and time for very little extra information);
+        stride 3 keeps overlap (useful augmentation) but cuts size 3x.
+        The "- SEQ_LEN" guarantees i + SEQ_LEN is a valid index.
+    X[i] = encoded[i : i+40]        -> the 40-character context
+    y[i] = encoded[i + 40]          -> the single next character (label)
+        This is the standard "next-character prediction" formulation:
+        a many-to-one sequence problem turned into multi-class
+        classification with 37 classes.
+    Result: X (66654, 40), y (66654,).
+
+CELL 5 - model definition and compilation
+    layers.Input((None,))
+        Shape (timesteps,) with timesteps = None means VARIABLE length.
+        Training uses 40 steps, but generation can feed any length.
+        Input dtype is int (ids), not float images.
+    layers.Embedding(37, 64)
+        Trainable lookup table: each character id -> a dense 64-dim
+        vector. Learned during training, so characters used in similar
+        contexts get similar vectors. Much better than one-hot:
+        dense, low-dimensional, and captures similarity.
+    layers.SimpleRNN(256)
+        THE recurrent layer required by the problem statement.
+        return_sequences defaults to False -> only the last hidden
+        state h_40 is returned, shape (batch, 256).
+        Default activation = tanh, recurrent init = orthogonal,
+        h_0 = zeros.
+    layers.Dense(37, activation="softmax")
+        Maps the 256-dim summary to 37 class probabilities.
+    compile:
+        optimizer = "adam"
+            Adaptive per-parameter learning rates; robust default for
+            RNNs, handles the different gradient scales of W_xh / W_hh.
+        loss = "sparse_categorical_crossentropy"
+            "sparse" because y is an INTEGER id, not a one-hot vector.
+            Internally applies log-softmax; correct pairing with a
+            softmax output layer.
+        metrics = ["accuracy"]
+            Fraction of next-characters predicted exactly right.
+            Easy to read, but perplexity is the better LM metric.
+    model.summary()
+        Prints the layer table and the 94,053 parameter total.
+
+CELL 6 - training
+    model.fit(X, y, batch_size=128, epochs=15, validation_split=0.1,
+              verbose=2)
+    batch_size=128
+        Good GPU/CPU utilisation; smaller batches are noisy, larger
+        batches smooth the gradient but slow convergence per epoch.
+    validation_split=0.1
+        Keras holds out the LAST 10% of the arrays (before shuffling)
+        to monitor generalisation each epoch.
+    verbose=2
+        One line per epoch with loss / accuracy / val_loss / val_accuracy.
+    During training the true context is always fed in (TEACHER FORCING).
+    The returned `history` object stores per-epoch metric lists.
+
+CELL 7 - curves and final metrics
+    Two side-by-side plots: loss and accuracy, train vs validation.
+        Used to check convergence and spot overfitting
+        (train keeps improving while validation flattens / worsens).
+    Final validation accuracy printed (expected around 0.46).
+    Perplexity = exp(validation_loss)
+        Because the loss is natural-log cross-entropy.
+        Interpretation: the model is as confused as if it had to pick
+        uniformly among ~6.7 characters at each step, instead of 37.
+        Lower is better; a perfect model has perplexity 1.
+
+CELL 8 - text generation (inference)
+    def generate(seed, length=300, temperature=0.5)
+        out = seed.lower()
+            Normalise the seed the same way as the training corpus.
+        Loop `length` times (one new character per iteration):
+            x = ids of out[-40:] reshaped to (1, 40)
+                Always feed only the LAST 40 characters -> a rolling
+                context window, so cost per step stays constant and the
+                input format matches training exactly.
+            probs = model(x, training=False).numpy()[0]
+                Forward pass -> 37 probabilities.
+                training=False = inference mode.
+                .astype("float64") for numerical stability in the
+                renormalisation step.
+            probs = exp(log(probs + 1e-9) / temperature)
+                TEMPERATURE RESCALING, done in log space:
+                    p_i  <-  p_i^(1/T)
+                + 1e-9 avoids log(0).
+                T < 1 sharpens the distribution (confident, repetitive,
+                      safer spelling).
+                T = 1 leaves the model's distribution unchanged.
+                T > 1 flattens it (more diverse, more spelling errors).
+            probs /= probs.sum()
+                Renormalise so it is a valid distribution again.
+            np.random.choice(len(chars), p=probs)
+                STOCHASTIC SAMPLING (not argmax). Sampling is what gives
+                varied, non-degenerate text; argmax tends to fall into
+                loops like "the people the people the people".
+            out += chars[chosen_id]
+                Append and repeat -> autoregressive generation.
+    seed = text[1000:1040]
+        A real 40-character slice of the corpus, so all characters are
+        in the vocabulary and the model starts in-distribution.
+    The loop over [0.2, 0.5, 1.0] demonstrates the diversity/accuracy
+    trade-off of temperature on the SAME seed and SAME model.
+
+
+---------------------------------------------------------------------
+6. EXPECTED RESULTS (typical run)
+---------------------------------------------------------------------
+Corpus size          : 200000 characters
+Vocabulary           : 37
+Training samples     : 66654  (X: 66654 x 40)
+Total parameters     : 94,053
+Time                 : ~12-13 s per epoch, ~3 minutes for 15 epochs
+Epoch 1  loss ~2.56, val_loss ~2.33, val_acc ~0.33
+Epoch 15 loss ~1.55, val_loss ~1.90, val_acc ~0.46
+Final validation accuracy : ~0.46
+Validation perplexity     : ~6.7
+
+Generated text characteristics:
+- Correct English-looking words, correct spacing and line breaks.
+- Learns the play script format ("name:" then a line of dialogue).
+- Locally plausible phrases, but NO coherent long-range meaning or
+  grammar - expected for a 40-char vanilla RNN.
+- temperature 0.2 : very repetitive, safest spelling, loops appear.
+- temperature 0.5 : best readability / variety balance.
+- temperature 1.0 : most creative, many non-words and typos.
+
+
+---------------------------------------------------------------------
+7. OBSERVATIONS / CONCLUSION
+---------------------------------------------------------------------
+1. A plain SimpleRNN with only ~94k parameters successfully learns
+   character-level English structure from 200k characters.
+2. Loss decreases steadily and perplexity drops from ~10 to ~6.7,
+   i.e. the model becomes ~5.5x "less confused" than uniform guessing
+   over 37 characters.
+3. Training accuracy exceeds validation accuracy towards the end ->
+   mild overfitting; more data / regularisation would help.
+4. Temperature is a pure inference-time knob: it changes creativity
+   without retraining.
+5. The model captures LOCAL statistics (spelling, morphology, script
+   layout) but not semantics, because the 40-step vanilla recurrence
+   cannot retain long-range information (vanishing gradient).
+6. Conclusion: an RNN is a valid and effective character-level text
+   generator; for longer, more coherent text a gated RNN (LSTM/GRU),
+   more data, or an attention/Transformer model is required.
+
+
+---------------------------------------------------------------------
+8. LIMITATIONS AND POSSIBLE IMPROVEMENTS
+---------------------------------------------------------------------
+Limitations
+- Short memory (40 chars); no sentence-level coherence.
+- Small corpus subset (200k of ~1.1M chars).
+- Overlapping windows make the random 10% hold-out optimistic:
+  neighbouring windows share ~37 of 40 characters, so validation is
+  not fully independent. A chronological split (e.g. first 90% of the
+  corpus for training, last 10% for validation) is stricter.
+- Only one recurrent layer; limited capacity.
+- Autoregressive generation suffers EXPOSURE BIAS: trained on real
+  contexts, but at inference it consumes its own (possibly wrong)
+  characters, so errors compound.
+
+Improvements
+- Use the full corpus and a longer SEQ_LEN (100-200).
+- Stack two SimpleRNN layers with return_sequences=True on the first.
+- Add Dropout / recurrent_dropout, or gradient clipping (clipnorm=1).
+- Replace SimpleRNN with GRU/LSTM for long-range structure.
+- Train a stateful RNN on continuous text streams.
+- Use top-k / nucleus (top-p) sampling instead of plain temperature.
+- Move to word-level or subword tokenisation, or a Transformer.
+
+
+---------------------------------------------------------------------
+9. VIVA QUESTIONS AND ANSWERS
+---------------------------------------------------------------------
+
+Q1. What is an RNN?
+A neural network with a recurrent connection: it processes a sequence
+step by step and passes a hidden state forward, giving it memory of
+previous inputs. The same weights are shared across all time steps.
+
+Q2. Why is an RNN used for text instead of a Dense or CNN model?
+Because text is order-dependent and variable-length. Dense layers need
+fixed-size input and ignore order; CNNs see only local windows. An RNN
+carries order information in its hidden state and accepts any length.
+
+Q3. Write the SimpleRNN equation.
+h_t = tanh(W_xh x_t + W_hh h_{t-1} + b_h). Output here is
+softmax(W_hy h_T + b_y).
+
+Q4. What is the hidden state?
+A learned fixed-size vector (256 numbers here) that summarises the
+sequence seen so far. It is the network's memory, recomputed at every
+character.
+
+Q5. Why tanh and not ReLU in SimpleRNN?
+tanh is bounded in (-1,1), which keeps the recurrent state from blowing
+up over many steps, and it is zero-centred. ReLU in a recurrence can
+cause unbounded state growth and exploding gradients.
+
+Q6. What is h_0 initialised to?
+A zero vector, by default in Keras.
+
+Q7. What is BPTT?
+Backpropagation Through Time: unroll the RNN over T steps into a deep
+feed-forward chain and backpropagate the loss through all T steps,
+summing the gradient contributions to the shared weights.
+
+Q8. What is the vanishing gradient problem in RNNs?
+The gradient at early time steps contains a product of T copies of
+W_hh and tanh derivatives (<=1), so it decays exponentially with T.
+Long-range dependencies therefore cannot be learned.
+
+Q9. What is the exploding gradient problem and its fix?
+If the recurrent weights amplify signals, gradients grow exponentially
+and training diverges (NaNs). Fix: gradient clipping (clipnorm/clipvalue),
+smaller learning rate, orthogonal initialisation.
+
+Q10. How do LSTM and GRU solve vanishing gradients?
+They add gated, largely ADDITIVE memory paths (LSTM cell state c_t with
+forget/input gates; GRU update gate). Additive updates let gradients
+flow across many steps without repeated multiplicative decay.
+
+Q11. Why did you use SimpleRNN and not LSTM here?
+The problem statement requires an RNN. Technically it is also sufficient:
+the context is only 40 characters, so dependencies are short; SimpleRNN
+has ~4x fewer parameters than LSTM and trains much faster.
+
+Q12. How many parameters does an LSTM of the same size have?
+4 * ((64 + 256) * 256 + 256) = 4 * 82,176 = 328,704 for the recurrent
+layer, versus 82,176 for SimpleRNN.
+
+Q13. Character-level vs word-level modelling?
+Char-level: tiny vocabulary (37), no out-of-vocabulary problem, learns
+spelling, but longer sequences and weaker semantics. Word-level: shorter
+sequences and better semantics, but huge vocabulary (10k+), large
+softmax, and unknown-word handling needed.
+
+Q14. Why lower-case the text?
+To merge upper/lower case variants, reducing the vocabulary from 65 to
+37 classes, which means more training examples per class and faster
+convergence.
+
+Q15. Why only 200,000 characters?
+To keep the dense NumPy window array and epoch time small enough for a
+lab machine. It is a speed/quality trade-off; more data improves quality.
+
+Q16. Why SEQ_LEN = 40?
+It gives enough context for local spelling and word patterns while
+keeping BPTT short enough for a vanilla RNN to train stably.
+
+Q17. Why stride 3 instead of 1?
+Stride 1 produces ~200k heavily overlapping, nearly duplicate windows
+(3x memory/time). Stride 3 keeps useful overlap but reduces the dataset
+to 66,654 samples.
+
+Q18. What are X and y exactly?
+X[i] = ids of characters i..i+39 (context). y[i] = id of character i+40
+(the single next character). Many-to-one formulation.
+
+Q19. What does the Embedding layer do?
+It is a trainable lookup table mapping each of the 37 ids to a dense
+64-dimensional vector. It replaces sparse one-hot vectors with compact
+learned representations where similar characters get similar vectors.
+
+Q20. Why Input((None,))?
+None means variable number of time steps. Training uses 40, but at
+generation we can pass any length; the RNN handles it with shared weights.
+
+Q21. Why does SimpleRNN output (None, 256) and not (None, 40, 256)?
+return_sequences=False (default) returns only the LAST hidden state.
+Setting it to True would return the state at every step, which is needed
+for stacked RNNs or many-to-many tasks.
+
+Q22. What is many-to-one vs one-to-many vs many-to-many?
+Many-to-one: a sequence -> one output (this task, also sentiment
+classification). One-to-many: one input -> a sequence (image captioning).
+Many-to-many: sequence -> sequence (translation, or per-step labelling).
+
+Q23. Why softmax at the output?
+It converts 37 raw scores into a normalised probability distribution so
+we can compute cross-entropy and sample the next character.
+
+Q24. Why sparse_categorical_crossentropy and not categorical_crossentropy?
+Labels are integer ids, not one-hot vectors. "Sparse" accepts integers
+directly, saving memory and the one-hot conversion step.
+
+Q25. Would from_logits=True be correct here?
+No. The final layer already applies softmax, so the outputs are
+probabilities, not logits. from_logits=True would double-apply softmax
+and give wrong gradients.
+
+Q26. Show the parameter count calculation.
+Embedding 37*64 = 2,368; SimpleRNN (64+256)*256 + 256 = 82,176;
+Dense 256*37 + 37 = 9,509. Total = 94,053.
+
+Q27. What is perplexity?
+exp(cross-entropy loss) when the loss uses natural log. It is the
+effective number of equally likely choices the model faces per step.
+Here ~6.7 out of 37 possible characters. Lower is better; ideal = 1.
+
+Q28. Is accuracy a good metric for text generation?
+Only a rough proxy. Next-character accuracy ignores that several
+characters may be plausible. Perplexity / log-likelihood (and human
+judgement of samples) are more meaningful.
+
+Q29. What is temperature sampling?
+Rescaling probabilities as p_i^(1/T) and renormalising. T<1 sharpens
+(confident, repetitive), T=1 unchanged, T>1 flattens (diverse, noisier).
+T->0 becomes greedy argmax; T->infinity becomes uniform random.
+
+Q30. Why compute temperature in log space?
+exp(log(p)/T) is numerically stable for very small probabilities and
+avoids underflow; +1e-9 prevents log(0).
+
+Q31. Why sample instead of taking argmax?
+Argmax is deterministic and gets stuck in repetitive loops. Sampling
+from the distribution produces varied, more natural-looking text.
+
+Q32. Why feed only the last 40 characters during generation?
+To match the training input format exactly and keep the per-step cost
+constant. Older context still influences the text indirectly through
+what was already generated.
+
+Q33. What is teacher forcing and exposure bias?
+Teacher forcing: during training the true previous characters are always
+used as context. Exposure bias: at inference the model consumes its OWN
+predictions, so one mistake shifts it off the training distribution and
+errors accumulate.
+
+Q34. Why does the output look like English but make no sense?
+The model learned local character statistics (spelling, spaces, script
+format) but the 40-step vanilla recurrence cannot maintain sentence-level
+or semantic context.
+
+Q35. What does the loss/accuracy graph tell you?
+Steady decrease in loss = learning. Train accuracy above validation
+accuracy at the end = mild overfitting. A rising validation loss while
+train loss falls would signal stronger overfitting -> stop earlier or
+regularise.
+
+Q36. Is the validation split here fully trustworthy?
+Not completely. Overlapping windows mean neighbouring samples share
+~37/40 characters, so the held-out tail is correlated with training
+data. A chronological (contiguous-block) split is a stricter evaluation.
+
+Q37. Why Adam?
+It adapts the learning rate per parameter using first and second moment
+estimates, which suits RNNs where input-to-hidden and hidden-to-hidden
+gradients have very different scales. It converges fast with little tuning.
+
+Q38. Effect of batch size 128?
+Balance between gradient noise and speed. Small batches = noisy but more
+updates; large batches = smoother gradients, better hardware utilisation,
+but can generalise slightly worse and need LR tuning.
+
+Q39. Why are RNNs slower to train than CNNs/Transformers?
+Time steps are inherently SEQUENTIAL: step t needs h_{t-1}, so they
+cannot be parallelised across the sequence, unlike convolutions or
+self-attention.
+
+Q40. What is a stateful RNN?
+A mode where the hidden state is carried across batches instead of being
+reset, letting the model learn dependencies longer than one window. It
+requires fixed, ordered, non-shuffled batches.
+
+Q41. What is a bidirectional RNN? Could you use it here?
+It runs one RNN forward and one backward and concatenates the states.
+Not usable for generation, because the backward pass would need future
+characters that do not exist yet. It is fine for classification.
+
+Q42. How would you improve this model?
+More data, longer context, stacked recurrent layers, dropout /
+recurrent_dropout, gradient clipping, GRU/LSTM cells, top-k or top-p
+sampling, or a Transformer with self-attention.
+
+Q43. Can the same RNN be used for classification?
+Yes. Replace the 37-way softmax with the number of classes (e.g. 1 sigmoid
+for sentiment) and train on labelled sequences. The final hidden state is
+already a fixed-size summary of the sequence.
+
+Q44. What happens if the seed contains a character not in the vocabulary?
+char_to_id raises a KeyError. That is why the seed is lower-cased and
+taken from the corpus itself; a robust version would filter or map
+unknown characters.
+
+Q45. What is the role of sorted(set(text))?
+set gives the unique characters (the vocabulary); sorted makes the
+id ordering deterministic so results are reproducible across runs.
+
+Q46. Why is the loss around 1.9 and not close to 0?
+Next-character prediction is genuinely ambiguous - many characters can
+plausibly follow a context. The irreducible entropy of English at the
+character level keeps the loss well above zero.
+
+Q47. What is greedy decoding vs beam search?
+Greedy picks the highest-probability character each step. Beam search
+keeps the top-k partial sequences and expands them, seeking a higher
+overall-likelihood output. Both are deterministic; sampling is stochastic.
+
+Q48. Which layer holds the "memory" of the network?
+SimpleRNN, via its hidden state h_t and the recurrent weight matrix W_hh.
+
+Q49. Total time steps of backpropagation per sample?
+40 (SEQ_LEN), since only the final step produces the loss but gradients
+flow back through all 40 recurrent applications.
+
+Q50. Summarise the practical in one sentence.
+A 94k-parameter Embedding -> SimpleRNN(256) -> softmax model was trained
+on 66,654 overlapping 40-character Shakespeare windows to predict the
+next character, reaching ~46% validation accuracy and perplexity ~6.7,
+and was then used autoregressively with temperature sampling to generate
+new Shakespeare-style text.
